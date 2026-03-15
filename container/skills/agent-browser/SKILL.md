@@ -157,3 +157,19 @@ agent-browser get text @e1  # Get product title
 agent-browser get attr @e2 href  # Get link URL
 agent-browser screenshot products.png
 ```
+
+## Host Browser (CDP Fallback)
+
+Decision tree:
+
+1. **`$AGENT_BROWSER_STATE` is set** → login sessions already loaded, use sandboxed browser normally
+2. **Site needs login or shows captcha** → use `/browser-cdp` skill: open in host Chrome, user interacts, export auth state
+3. **After export** → switch back to sandboxed browser; future runs are fully automatic
+
+```bash
+# Quick check
+echo "CDP_ENABLED=$CDP_ENABLED"
+echo "AGENT_BROWSER_STATE=$AGENT_BROWSER_STATE"
+```
+
+For the full CDP flow (connect → user logs in → export auth state), see the `/browser-cdp` skill.

@@ -7,6 +7,8 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  CDP_ENABLED,
+  CDP_PORT,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -199,6 +201,17 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Mount host browser auth state if it exists (exported from host Chrome CDP).
+  // This lets the sandboxed browser use login sessions from the host Chrome profile.
+  const authStatePath = path.join(DATA_DIR, 'chrome-cdp', 'auth-state.json');
+  if (fs.existsSync(authStatePath)) {
+    mounts.push({
+      hostPath: path.dirname(authStatePath),
+      containerPath: '/workspace/browser-auth',
+      readonly: true,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -236,6 +249,24 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // CDP relay: pass config so container entrypoint starts socat forwarding.
+  // Container-side socat forwards localhost:CDP_PORT → host.docker.internal:CDP_PORT
+  // so agent-browser's CDP auto-discovery works (Chrome returns ws://localhost:... URLs).
+  if (CDP_ENABLED) {
+    args.push('-e', 'CDP_ENABLED=1');
+    args.push('-e', `CDP_PORT=${CDP_PORT}`);
+  }
+
+  // Auth state: point agent-browser to exported cookies from host Chrome profile.
+  // This lets the sandboxed browser use login sessions without needing CDP at runtime.
+  const authStatePath = path.join(DATA_DIR, 'chrome-cdp', 'auth-state.json');
+  if (fs.existsSync(authStatePath)) {
+    args.push(
+      '-e',
+      'AGENT_BROWSER_STATE=/workspace/browser-auth/auth-state.json',
+    );
   }
 
   // Runtime-specific args for host gateway resolution
