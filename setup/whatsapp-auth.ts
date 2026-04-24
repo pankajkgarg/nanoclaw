@@ -71,6 +71,16 @@ try {
 
 type AuthMethod = 'qr' | 'pairing-code';
 
+function hasRegisteredAuth(): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf-8');
+    const creds = JSON.parse(raw) as { registered?: boolean };
+    return creds.registered === true;
+  } catch {
+    return false;
+  }
+}
+
 function parseArgs(args: string[]): { method: AuthMethod; phone?: string } {
   let method: AuthMethod = 'qr';
   let phone: string | undefined;
@@ -104,7 +114,7 @@ function parseArgs(args: string[]): { method: AuthMethod; phone?: string } {
 export async function run(args: string[]): Promise<void> {
   const { method, phone } = parseArgs(args);
 
-  if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
+  if (hasRegisteredAuth()) {
     emitStatus('WHATSAPP_AUTH', {
       STATUS: 'skipped',
       REASON: 'already-authenticated',
