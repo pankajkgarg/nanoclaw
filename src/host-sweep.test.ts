@@ -143,4 +143,14 @@ describe('decideStuckAction', () => {
     });
     expect(res.action).toBe('ok');
   });
+
+  it('treats SQLite datetime strings as UTC, not local time', () => {
+    const res = decideStuckAction({
+      now: Date.parse('2026-04-24T21:50:55.000Z'),
+      heartbeatMtimeMs: 0,
+      containerState: null,
+      claims: [{ message_id: 'msg-utc', status_changed: '2026-04-24 21:50:54' }],
+    });
+    expect(res.action).toBe('ok');
+  });
 });

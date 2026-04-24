@@ -94,7 +94,7 @@ export function decideStuckAction(args: {
 
   const tolerance = Math.max(CLAIM_STUCK_MS, declaredBashMs ?? 0);
   for (const claim of claims) {
-    const claimedAt = Date.parse(claim.status_changed);
+    const claimedAt = parseDbTimestampMs(claim.status_changed);
     if (Number.isNaN(claimedAt)) continue;
     const claimAge = now - claimedAt;
     if (claimAge <= tolerance) continue;
@@ -103,6 +103,17 @@ export function decideStuckAction(args: {
   }
 
   return { action: 'ok' };
+}
+
+function parseDbTimestampMs(value: string): number {
+  // SQLite datetime('now') returns UTC as "YYYY-MM-DD HH:MM:SS" with no
+  // timezone marker. JS parses that shape as local time, which makes fresh
+  // claims look hours old outside UTC. ISO strings with timezone markers are
+  // already unambiguous and should be left alone.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) {
+    return Date.parse(`${value.replace(' ', 'T')}Z`);
+  }
+  return Date.parse(value);
 }
 
 let running = false;
@@ -262,7 +273,7 @@ function resetStuckProcessingRows(
     // Already rescheduled for a future retry — don't bump tries again. The
     // wake path (sweep step 2) will fire when process_after elapses and a
     // fresh container will clean the orphan claim on startup.
-    if (msg.processAfter && Date.parse(msg.processAfter) > now) continue;
+    if (msg.processAfter && parseDbTimestampMs(msg.processAfter) > now) continue;
 
     if (msg.tries >= MAX_TRIES) {
       markMessageFailed(inDb, msg.id);
