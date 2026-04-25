@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+claw — NanoClaw v2 CLI
+
+Talk to the running NanoClaw service over its local Unix socket.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sqlite3
+import sys
+from pathlib import Path
+
+
+def find_nanoclaw_dir() -> Path:
+    if env := os.environ.get("NANOCLAW_DIR"):
+        return Path(env).expanduser().resolve()
+    here = Path(__file__).resolve()
+    for parent in [here.parent, here.parent.parent, Path.cwd()]:
+        if (parent / "data" / "v2.db").exists() or (parent / ".env").exists():
+            return parent.resolve()
+    return Path.home() / "src" / "nanoclaw"
+
+
+NANOCLAW_DIR = find_nanoclaw_dir()
+DB_PATH = NANOCLAW_DIR / "data" / "v2.db"
+SOCKET_PATH = NANOCLAW_DIR / "data" / "cli.sock"
+
+
+def get_groups() -> list[dict]:
+    if not DB_PATH.exists():
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+              mg.id AS messaging_group_id,
+              mg.channel_type,
+              mg.platform_id,
+              COALESCE(NULLIF(mg.name, ''), mg.platform_id) AS messaging_name,
+              mg.is_group,
+              ag.id AS agent_group_id,
+              ag.name AS agent_name,
+              ag.folder AS folder,
+              mga.engage_mode
+            FROM messaging_group_agents mga
+            JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+            JOIN agent_groups ag ON ag.id = mga.agent_group_id
+            ORDER BY mg.channel_type, messaging_name, ag.name
+            """
+        ).fetchall()
+    except sqlite3.OperationalError as err:
+        sys.exit(f"error: cannot read NanoClaw v2 DB at {DB_PATH}: {err}")
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def find_group(groups: list[dict], query: str) -> dict | None:
+    q = query.lower()
+    fields = ("messaging_name", "platform_id", "folder", "agent_name", "channel_type")
+    exact = [g for g in groups if any(str(g[f]).lower() == q for f in fields if g.get(f) is not None)]
+    if len(exact) == 1:
+        return exact[0]
+    matches = [g for g in groups if any(q in str(g[f]).lower() for f in fields if g.get(f) is not None)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        names = ", ".join(f"{g['channel_type']}:{g['messaging_name']}" for g in matches)
+        sys.exit(f"error: ambiguous group '{query}'. Matches: {names}")
+    return None
+
+
+def read_prompt(args: argparse.Namespace) -> str | None:
+    if args.pipe or (not sys.stdin.isatty() and not args.prompt):
+        stdin_text = sys.stdin.read().strip()
+        return f"{args.prompt}\n\n{stdin_text}" if args.prompt else stdin_text
+    return args.prompt
+
+
+def send(payload: dict, timeout: int, raw: bool) -> int:
+    if not SOCKET_PATH.exists():
+        print(
+            f"error: NanoClaw service is not listening at {SOCKET_PATH}\n"
+            "Start it, then retry. Common check: pnpm run chat hi",
+            file=sys.stderr,
+        )
+        return 1
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(str(SOCKET_PATH))
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+
+        buffer = ""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                print(f"error: timed out after {timeout}s waiting for a reply", file=sys.stderr)
+                return 1
+            if not chunk:
+                return 0
+            buffer += chunk.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                if not line.strip():
+                    continue
+                if raw:
+                    print(line)
+                    continue
+                try:
+                    data = json.loads(line)
+                    print(data.get("text", line))
+                except json.JSONDecodeError:
+                    print(line)
+                return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="claw",
+        description="Talk to a running NanoClaw v2 service from the command line.",
+    )
+    parser.add_argument("prompt", nargs="?", help="Prompt to send")
+    parser.add_argument("-g", "--group", help="Messaging group/channel name, folder, or platform id")
+    parser.add_argument("-j", "--jid", help="Exact platform id/JID")
+    parser.add_argument("-p", "--pipe", action="store_true", help="Read prompt from stdin")
+    parser.add_argument("--list-groups", action="store_true", help="List wired messaging groups")
+    parser.add_argument("--raw", action="store_true", help="Print raw JSON socket response")
+    parser.add_argument("--timeout", type=int, default=300, metavar="SECS", help="Reply timeout")
+    parser.add_argument("-s", "--session", help="Not supported by the v2 socket CLI")
+    parser.add_argument("--runtime", choices=["docker", "container"], help=argparse.SUPPRESS)
+    parser.add_argument("--image", help=argparse.SUPPRESS)
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show resolved NanoClaw paths")
+    args = parser.parse_args()
+
+    if args.verbose:
+        print(f"NANOCLAW_DIR={NANOCLAW_DIR}", file=sys.stderr)
+        print(f"DB_PATH={DB_PATH}", file=sys.stderr)
+        print(f"SOCKET_PATH={SOCKET_PATH}", file=sys.stderr)
+
+    groups = get_groups()
+
+    if args.list_groups:
+        print(f"{'CHANNEL':<10} {'NAME':<28} {'AGENT':<20} {'FOLDER':<22} PLATFORM_ID")
+        print("-" * 110)
+        for g in groups:
+            main_tag = " [default]" if g["channel_type"] == "cli" and g["platform_id"] == "local" else ""
+            print(
+                f"{g['channel_type']:<10} {g['messaging_name']:<28} "
+                f"{g['agent_name']:<20} {g['folder']:<22} {g['platform_id']}{main_tag}"
+            )
+        return 0
+
+    if args.session:
+        print("error: -s/--session is not supported by NanoClaw v2 socket CLI", file=sys.stderr)
+        return 1
+
+    prompt = read_prompt(args)
+    if not prompt:
+        parser.print_help()
+        return 1
+
+    payload: dict = {"text": prompt}
+    target = args.jid or args.group
+    if target:
+        group = next((g for g in groups if g["platform_id"] == args.jid), None) if args.jid else find_group(groups, args.group)
+        if group is None:
+            print(f"error: group '{target}' not found. Run: claw --list-groups", file=sys.stderr)
+            return 1
+        payload["to"] = {
+            "channelType": group["channel_type"],
+            "platformId": group["platform_id"],
+            "threadId": None,
+        }
+        payload["reply_to"] = {"channelType": "cli", "platformId": "local", "threadId": None}
+
+    return send(payload, args.timeout, args.raw)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
