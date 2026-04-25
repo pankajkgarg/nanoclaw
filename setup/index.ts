@@ -22,6 +22,7 @@ const STEPS: Record<
   service: () => import('./service.js'),
   verify: () => import('./verify.js'),
   onecli: () => import('./onecli.js'),
+  'media-secrets': () => import('./media-secrets.js'),
   auth: () => import('./auth.js'),
   'cli-agent': () => import('./cli-agent.js'),
 };

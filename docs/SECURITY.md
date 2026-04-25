@@ -66,13 +66,23 @@ Messages and task operations are verified against group identity:
 
 ### 5. Credential Isolation (OneCLI Agent Vault)
 
-Real API credentials **never enter containers**. NanoClaw uses [OneCLI's Agent Vault](https://github.com/onecli/onecli) to proxy outbound requests and inject credentials at the gateway level.
+Real API keys **never enter containers**. NanoClaw uses [OneCLI's Agent Vault](https://github.com/onecli/onecli) to proxy outbound requests and inject credentials at the gateway level.
 
 **How it works:**
 1. Credentials are registered once with `onecli secrets create`, stored and managed by OneCLI
 2. When NanoClaw spawns a container, it calls `applyContainerConfig()` to route outbound HTTPS through the OneCLI gateway
 3. The gateway matches requests by host and path, injects the real credential, and forwards
 4. Agents cannot discover real credentials — not in environment, stdin, files, or `/proc`
+
+Media API key helpers:
+
+```bash
+FAL_KEY=... OPENROUTER_API_KEY=... pnpm exec tsx setup/index.ts --step media-secrets
+```
+
+This registers fal.ai as `Authorization: Key {value}` for `fal.run`, `queue.fal.run`, and `api.fal.ai`, and OpenRouter as `Authorization: Bearer {value}` for `openrouter.ai/api/*`. Containers receive only placeholder env vars so SDKs start; OneCLI injects the real headers.
+
+**Google/YouTube exception:** YouTube upload currently uses a local OAuth token JSON that can refresh itself. Because current OneCLI generic secrets only inject HTTP headers, set `NANOCLAW_GOOGLE_OAUTH_CREDS_PATH=/absolute/path/to/mom_account_google_oauth_creds.json` to mount that single file at `/workspace/secrets/mom_account_google_oauth_creds.json`.
 
 **Per-agent policies:**
 Each NanoClaw group gets its own OneCLI agent identity. This allows different credential policies per group (e.g. your sales agent vs. support agent). OneCLI supports rate limits, and time-bound access and approval flows are on the roadmap.
@@ -82,6 +92,9 @@ Each NanoClaw group gets its own OneCLI agent identity. This allows different cr
 - Mount allowlist — external, never mounted
 - Any credentials matching blocked patterns
 - `.env` is shadowed with `/dev/null` in the project root mount
+
+**Explicitly Mounted Exception:**
+- `NANOCLAW_GOOGLE_OAUTH_CREDS_PATH`, when set, mounts one Google OAuth token JSON for YouTube upload.
 
 ## Privilege Comparison
 

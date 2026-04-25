@@ -6,7 +6,15 @@ import { getContainerImageBase, getDefaultContainerImage, getInstallSlug } from 
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ONECLI_URL', 'ONECLI_API_KEY', 'TZ']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'ONECLI_URL',
+  'ONECLI_API_KEY',
+  'TZ',
+  'NANOCLAW_GROUPS_DIR',
+  'NANOCLAW_GOOGLE_OAUTH_CREDS_PATH',
+]);
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
@@ -20,8 +28,12 @@ const HOME_DIR = process.env.HOME || os.homedir();
 export const MOUNT_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 'mount-allowlist.json');
 export const SENDER_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 'sender-allowlist.json');
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
-export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
+export const GROUPS_DIR = path.resolve(
+  process.env.NANOCLAW_GROUPS_DIR || envConfig.NANOCLAW_GROUPS_DIR || path.join(PROJECT_ROOT, 'groups'),
+);
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+export const NANOCLAW_GOOGLE_OAUTH_CREDS_PATH =
+  process.env.NANOCLAW_GOOGLE_OAUTH_CREDS_PATH || envConfig.NANOCLAW_GOOGLE_OAUTH_CREDS_PATH;
 
 // Per-checkout image tag so two installs on the same host don't share
 // `nanoclaw-agent:latest` and clobber each other on rebuild.

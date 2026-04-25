@@ -15,6 +15,7 @@ import {
   CONTAINER_INSTALL_LABEL,
   DATA_DIR,
   GROUPS_DIR,
+  NANOCLAW_GOOGLE_OAUTH_CREDS_PATH,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
@@ -46,6 +47,13 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
+
+export const MEDIA_CREDENTIAL_PLACEHOLDERS: Record<string, string> = {
+  FAL_KEY: 'placeholder',
+  OPENROUTER_API_KEY: 'placeholder',
+};
+
+export const GOOGLE_OAUTH_CREDS_CONTAINER_PATH = '/workspace/secrets/mom_account_google_oauth_creds.json';
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
@@ -119,8 +127,9 @@ async function spawnContainer(session: Session): Promise<void> {
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
   const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const mediaContribution = buildMediaCredentialContainerConfig();
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
+  const mounts = buildMounts(agentGroup, session, containerConfig, contribution, mediaContribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -132,6 +141,7 @@ async function spawnContainer(session: Session): Promise<void> {
     containerConfig,
     provider,
     contribution,
+    mediaContribution,
     agentIdentifier,
   );
 
@@ -232,6 +242,7 @@ function buildMounts(
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
   providerContribution: ProviderContainerContribution,
+  mediaContribution: ProviderContainerContribution = buildMediaCredentialContainerConfig(),
 ): VolumeMount[] {
   const projectRoot = process.cwd();
 
@@ -319,7 +330,33 @@ function buildMounts(
     mounts.push(...providerContribution.mounts);
   }
 
+  // Media credential exception: Google OAuth file is not header-injectable by
+  // OneCLI today, so mount only the explicit token file when configured.
+  if (mediaContribution.mounts) {
+    mounts.push(...mediaContribution.mounts);
+  }
+
   return mounts;
+}
+
+export function buildMediaCredentialContainerConfig(
+  googleOAuthCredsPath: string | undefined = NANOCLAW_GOOGLE_OAUTH_CREDS_PATH,
+): ProviderContainerContribution {
+  const env: Record<string, string> = { ...MEDIA_CREDENTIAL_PLACEHOLDERS };
+  const mounts: VolumeMount[] = [];
+
+  if (googleOAuthCredsPath?.trim()) {
+    const hostPath = path.resolve(googleOAuthCredsPath.trim());
+    const stat = fs.statSync(hostPath);
+    fs.accessSync(hostPath, fs.constants.R_OK);
+    if (!stat.isFile()) {
+      throw new Error(`NANOCLAW_GOOGLE_OAUTH_CREDS_PATH must point to a file: ${hostPath}`);
+    }
+    mounts.push({ hostPath, containerPath: GOOGLE_OAUTH_CREDS_CONTAINER_PATH, readonly: false });
+    env.GOOGLE_APPLICATION_CREDENTIALS = GOOGLE_OAUTH_CREDS_CONTAINER_PATH;
+  }
+
+  return { env, mounts };
 }
 
 /**
@@ -419,6 +456,7 @@ async function buildContainerArgs(
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
+  mediaContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
@@ -430,6 +468,14 @@ async function buildContainerArgs(
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
+
+  // Placeholder env vars keep SDKs/CLIs happy. The real fal.ai/OpenRouter
+  // secrets are injected by the OneCLI HTTPS proxy on matching requests.
+  if (mediaContribution.env) {
+    for (const [key, value] of Object.entries(mediaContribution.env)) {
       args.push('-e', `${key}=${value}`);
     }
   }
