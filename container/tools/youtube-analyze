@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+youtube-analyze — Download and analyze a YouTube video for structure,
+content, and style. Produces a structured JSON report with transcript,
+scene boundaries, keyframes, OCR text, and audio analysis.
+
+Usage:
+    youtube-analyze <url> [options]
+
+Options:
+    --output-dir DIR        Output directory (default: temp/youtube/<video-id>/)
+    --max-duration SECS     Skip videos longer than this (default: 600)
+    --no-transcribe         Skip speech transcription
+    --no-ocr                Skip OCR on keyframes
+    --no-audio-analysis     Skip librosa audio analysis
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import traceback
+
+def run(cmd, **kwargs):
+    """Run a shell command, return stdout."""
+    result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
+    return result.stdout.strip()
+
+def extract_video_id(url):
+    """Extract YouTube video ID from URL."""
+    patterns = [
+        r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})',
+        r'(?:shorts/)([a-zA-Z0-9_-]{11})',
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+def step_download(url, out_dir, max_duration, warnings):
+    """Download video + metadata with yt-dlp."""
+    print("[1/7] Downloading video...", file=sys.stderr)
+    meta_file = os.path.join(out_dir, "metadata.json")
+    video_file = os.path.join(out_dir, "video.%(ext)s")
+
+    # Download metadata first to check duration
+    run(["yt-dlp", "--dump-json", "--no-download", url],)
+    meta_raw = run(["yt-dlp", "--dump-json", "--no-download", url])
+    meta = json.loads(meta_raw)
+
+    duration = meta.get("duration", 0)
+    if duration > max_duration:
+        raise RuntimeError(
+            f"Video is {duration}s, exceeds --max-duration {max_duration}s. "
+            f"Use --max-duration {duration} to override."
+        )
+
+    with open(meta_file, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    # Download video (max 1080p)
+    run([
+        "yt-dlp",
+        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "--merge-output-format", "mp4",
+        "-o", video_file,
+        "--no-playlist",
+        url,
+    ])
+
+    # Find the actual downloaded file
+    for f in os.listdir(out_dir):
+        if f.startswith("video.") and not f.endswith(".json"):
+            return os.path.join(out_dir, f), meta
+    raise RuntimeError("Downloaded video file not found")
+
+def step_extract_audio(video_path, out_dir, warnings):
+    """Extract audio in two formats: 16kHz mono for whisper, full for librosa."""
+    print("[2/7] Extracting audio...", file=sys.stderr)
+    audio_16k = os.path.join(out_dir, "audio_16k.wav")
+    audio_full = os.path.join(out_dir, "audio.wav")
+
+    run(["ffmpeg", "-y", "-i", video_path, "-ar", "16000", "-ac", "1",
+         "-vn", audio_16k])
+    run(["ffmpeg", "-y", "-i", video_path, "-vn", audio_full])
+
+    return audio_16k, audio_full
+
+def step_transcribe(audio_16k, warnings):
+    """Transcribe audio with faster-whisper (small model)."""
+    print("[3/7] Transcribing speech...", file=sys.stderr)
+    try:
+        from faster_whisper import WhisperModel
+        model = WhisperModel("small", device="cpu", compute_type="int8")
+        segments, info = model.transcribe(audio_16k, beam_size=5)
+
+        transcript = []
+        for seg in segments:
+            transcript.append({
+                "start": round(seg.start, 2),
+                "end": round(seg.end, 2),
+                "text": seg.text.strip(),
+            })
+        return transcript, {
+            "language": info.language,
+            "language_probability": round(info.language_probability, 3),
+        }
+    except Exception as e:
+        warnings.append(f"Transcription failed: {e}")
+        return [], {}
+
+def step_detect_scenes(video_path, warnings):
+    """Detect scene boundaries with PySceneDetect."""
+    print("[4/7] Detecting scenes...", file=sys.stderr)
+    try:
+        from scenedetect import open_video, SceneManager
+        from scenedetect.detectors import ContentDetector
+
+        video = open_video(video_path)
+        scene_manager = SceneManager()
+        scene_manager.add_detector(ContentDetector(threshold=27.0))
+        scene_manager.detect_scenes(video)
+
+        scene_list = scene_manager.get_scene_list()
+        scenes = []
+        for i, (start, end) in enumerate(scene_list):
+            scenes.append({
+                "index": i,
+                "start_time": round(start.get_seconds(), 2),
+                "end_time": round(end.get_seconds(), 2),
+                "duration": round((end - start).get_seconds(), 2),
+            })
+        return scenes
+    except Exception as e:
+        warnings.append(f"Scene detection failed: {e}")
+        return []
+
+def step_extract_keyframes(video_path, scenes, out_dir, warnings):
+    """Extract a keyframe JPEG at each scene boundary."""
+    print("[5/7] Extracting keyframes...", file=sys.stderr)
+    kf_dir = os.path.join(out_dir, "keyframes")
+    os.makedirs(kf_dir, exist_ok=True)
+
+    if not scenes:
+        # No scenes detected — extract frames at regular intervals
+        try:
+            probe = run(["ffprobe", "-v", "error", "-show_entries",
+                        "format=duration", "-of", "json", video_path])
+            duration = float(json.loads(probe)["format"]["duration"])
+            # One keyframe every 10 seconds
+            interval = 10
+            times = [i * interval for i in range(int(duration / interval) + 1)]
+            for i, t in enumerate(times):
+                kf_path = os.path.join(kf_dir, f"frame_{i:03d}.jpg")
+                try:
+                    run(["ffmpeg", "-y", "-ss", str(t), "-i", video_path,
+                         "-frames:v", "1", "-q:v", "2", kf_path])
+                except Exception:
+                    pass
+            return kf_dir
+        except Exception as e:
+            warnings.append(f"Keyframe extraction (interval) failed: {e}")
+            return kf_dir
+
+    for scene in scenes:
+        kf_path = os.path.join(kf_dir, f"scene_{scene['index']:03d}.jpg")
+        t = scene["start_time"] + 0.5  # Slightly after cut
+        try:
+            run(["ffmpeg", "-y", "-ss", str(t), "-i", video_path,
+                 "-frames:v", "1", "-q:v", "2", kf_path])
+            scene["keyframe"] = f"keyframes/scene_{scene['index']:03d}.jpg"
+        except Exception as e:
+            warnings.append(f"Keyframe extraction failed for scene {scene['index']}: {e}")
+            scene["keyframe"] = None
+
+    return kf_dir
+
+def step_ocr_keyframes(kf_dir, scenes, warnings):
+    """OCR each keyframe with pytesseract."""
+    print("[6/7] Running OCR on keyframes...", file=sys.stderr)
+    try:
+        import pytesseract
+        from PIL import Image
+
+        for scene in scenes:
+            kf = scene.get("keyframe")
+            if not kf:
+                scene["ocr_text"] = ""
+                continue
+            kf_path = os.path.join(os.path.dirname(kf_dir), kf)
+            if not os.path.exists(kf_path):
+                # Try absolute path within kf_dir parent
+                kf_path = os.path.join(kf_dir, os.path.basename(kf))
+            try:
+                img = Image.open(kf_path)
+                text = pytesseract.image_to_string(img).strip()
+                scene["ocr_text"] = text
+            except Exception as e:
+                scene["ocr_text"] = ""
+                warnings.append(f"OCR failed for {kf}: {e}")
+
+        # Also OCR interval-based frames if no scenes
+        if not scenes:
+            for fname in sorted(os.listdir(kf_dir)):
+                if fname.endswith(".jpg"):
+                    try:
+                        img = Image.open(os.path.join(kf_dir, fname))
+                        text = pytesseract.image_to_string(img).strip()
+                        if text:
+                            warnings.append(f"OCR [{fname}]: {text[:200]}")
+                    except Exception:
+                        pass
+    except ImportError as e:
+        warnings.append(f"OCR skipped (missing dependency): {e}")
+    except Exception as e:
+        warnings.append(f"OCR failed: {e}")
+
+def step_audio_analysis(audio_full, warnings):
+    """Analyze audio with librosa: BPM, key estimate, loudness."""
+    print("[7/7] Analyzing audio...", file=sys.stderr)
+    try:
+        import librosa
+        import numpy as np
+
+        y, sr = librosa.load(audio_full, sr=None)
+
+        # BPM
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        bpm = float(np.atleast_1d(tempo)[0])
+
+        # Key estimation via chroma
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        key_names = ['C', 'C#', 'D', 'D#', 'E', 'F',
+                     'F#', 'G', 'G#', 'A', 'A#', 'B']
+        key_strengths = chroma.mean(axis=1)
+        key_idx = int(np.argmax(key_strengths))
+        key_estimate = key_names[key_idx]
+
+        # Simple major/minor guess from chroma profile
+        major_profile = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
+        minor_profile = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
+        rotated_major = np.roll(major_profile, key_idx)
+        rotated_minor = np.roll(minor_profile, key_idx)
+        major_corr = float(np.corrcoef(key_strengths, rotated_major)[0, 1])
+        minor_corr = float(np.corrcoef(key_strengths, rotated_minor)[0, 1])
+        mode = "major" if major_corr >= minor_corr else "minor"
+
+        # Loudness profile (RMS in dB, sampled every 5 seconds)
+        rms = librosa.feature.rms(y=y)[0]
+        hop_length = 512
+        times = librosa.frames_to_time(range(len(rms)), sr=sr, hop_length=hop_length)
+        interval = 5.0
+        loudness_profile = []
+        next_t = 0.0
+        for i, t in enumerate(times):
+            if t >= next_t:
+                db = float(20 * np.log10(rms[i] + 1e-10))
+                loudness_profile.append({"time": round(t, 1), "db": round(db, 1)})
+                next_t += interval
+
+        # Speech vs music detection (rough heuristic via spectral flatness)
+        flatness = librosa.feature.spectral_flatness(y=y)[0]
+        avg_flatness = float(np.mean(flatness))
+        has_speech = avg_flatness > 0.01
+        has_music = avg_flatness < 0.5
+
+        return {
+            "bpm": round(bpm, 1),
+            "key_estimate": f"{key_estimate} {mode}",
+            "has_speech": has_speech,
+            "has_music": has_music,
+            "loudness_profile": loudness_profile,
+        }
+    except Exception as e:
+        warnings.append(f"Audio analysis failed: {e}\n{traceback.format_exc()}")
+        return {}
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze a YouTube video")
+    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument("--output-dir", default=None, help="Output directory")
+    parser.add_argument("--max-duration", type=int, default=600,
+                        help="Max video duration in seconds (default: 600)")
+    parser.add_argument("--no-transcribe", action="store_true")
+    parser.add_argument("--no-ocr", action="store_true")
+    parser.add_argument("--no-audio-analysis", action="store_true")
+    args = parser.parse_args()
+
+    video_id = extract_video_id(args.url)
+    if not video_id:
+        print(f"Error: Could not extract video ID from URL: {args.url}", file=sys.stderr)
+        sys.exit(1)
+
+    out_dir = args.output_dir or os.path.join("temp", "youtube", video_id)
+    os.makedirs(out_dir, exist_ok=True)
+
+    warnings = []
+    report = {
+        "video_id": video_id,
+        "url": args.url,
+        "warnings": warnings,
+    }
+
+    # Step 1: Download
+    try:
+        video_path, meta = step_download(args.url, out_dir, args.max_duration, warnings)
+        report["title"] = meta.get("title", "")
+        report["duration_seconds"] = meta.get("duration", 0)
+        report["resolution"] = f"{meta.get('width', '?')}x{meta.get('height', '?')}"
+        report["fps"] = meta.get("fps", 0)
+        report["metadata"] = {
+            "uploader": meta.get("uploader", ""),
+            "upload_date": meta.get("upload_date", ""),
+            "description": (meta.get("description") or "")[:2000],
+            "tags": meta.get("tags", []),
+        }
+    except Exception as e:
+        print(f"Error: Download failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 2: Extract audio
+    try:
+        audio_16k, audio_full = step_extract_audio(video_path, out_dir, warnings)
+    except Exception as e:
+        warnings.append(f"Audio extraction failed: {e}")
+        audio_16k, audio_full = None, None
+
+    # Step 3: Transcribe
+    if not args.no_transcribe and audio_16k:
+        transcript, transcript_info = step_transcribe(audio_16k, warnings)
+        report["transcript"] = transcript
+        report["transcript_info"] = transcript_info
+    else:
+        report["transcript"] = []
+        report["transcript_info"] = {}
+
+    # Step 4: Scene detection
+    scenes = step_detect_scenes(video_path, warnings)
+    report["scenes"] = scenes
+
+    # Step 5: Extract keyframes
+    kf_dir = step_extract_keyframes(video_path, scenes, out_dir, warnings)
+
+    # Step 6: OCR
+    if not args.no_ocr:
+        step_ocr_keyframes(kf_dir, scenes, warnings)
+
+    # Step 7: Audio analysis
+    if not args.no_audio_analysis and audio_full:
+        report["audio_analysis"] = step_audio_analysis(audio_full, warnings)
+    else:
+        report["audio_analysis"] = {}
+
+    # File listing
+    report["files"] = {
+        "video": os.path.relpath(video_path, out_dir),
+        "audio_full": "audio.wav" if audio_full else None,
+        "audio_16k": "audio_16k.wav" if audio_16k else None,
+        "analysis": "analysis.json",
+        "keyframes_dir": "keyframes/",
+    }
+
+    # Write report
+    report_path = os.path.join(out_dir, "analysis.json")
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    print(report_path)
+    print(f"Analysis complete: {report_path}", file=sys.stderr)
+    if warnings:
+        print(f"  {len(warnings)} warning(s) — see analysis.json", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

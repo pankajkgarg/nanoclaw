@@ -22,6 +22,7 @@ ARG INSTALL_CJK_FONTS=false
 ARG CLAUDE_CODE_VERSION=2.1.116
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=latest
+ARG REMOTION_VERSION=latest
 ARG BUN_VERSION=1.3.12
 
 # ---- System dependencies -----------------------------------------------------
@@ -31,8 +32,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
         chromium \
+        build-essential \
         fonts-liberation \
         fonts-noto-color-emoji \
+        ffmpeg \
+        file \
         libgbm1 \
         libnss3 \
         libatk-bridge2.0-0 \
@@ -42,23 +46,52 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libxdamage1 \
         libxrandr2 \
         libasound2 \
-        libpangocairo-1.0-0 \
         libcups2 \
         libdrm2 \
+        libsndfile1-dev \
         libxshmfence1 \
         ca-certificates \
         curl \
         git \
+        jq \
+        less \
+        pkg-config \
+        procps \
+        psmisc \
+        python-is-python3 \
+        python3 \
+        python3-pip \
+        ripgrep \
+        tesseract-ocr \
+        tesseract-ocr-eng \
         tini \
         unzip \
+        wget \
+        zip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
     && rm -rf /var/lib/apt/lists/*
 
+RUN pip3 install --break-system-packages \
+        fal-client \
+        yt-dlp \
+        faster-whisper \
+        "scenedetect[opencv]" \
+        opencv-python-headless \
+        pytesseract \
+        librosa \
+        moviepy \
+        google-auth \
+        google-auth-oauthlib \
+        google-auth-httplib2 \
+        google-api-python-client
+
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+ENV CHROME_PATH=/usr/bin/chromium
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 # Belt-and-braces: prevent Playwright's postinstall from downloading its own
 # ~300MB Chromium. We've already installed the system one above.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
@@ -90,7 +123,9 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+ENV REMOTION_HOME="/opt/remotion"
+ENV PATH="$REMOTION_HOME/bin:$PNPM_HOME:$PATH"
+ENV NODE_PATH="$REMOTION_HOME/lib/node_modules"
 RUN corepack enable
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
@@ -104,17 +139,31 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g --prefix "$REMOTION_HOME" \
+        "remotion@${REMOTION_VERSION}" \
+        "@remotion/cli@${REMOTION_VERSION}" \
+        react \
+        react-dom \
+        typescript \
+        @types/react \
+        zod@4.3.6 && \
+    npm cache clean --force
+
+COPY tools/youtube-analyze /usr/local/bin/youtube-analyze
+RUN chmod +x /usr/local/bin/youtube-analyze
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # ---- Workspace + permissions -------------------------------------------------
-RUN mkdir -p /workspace/group /workspace/extra && \
+RUN mkdir -p /workspace/agent /workspace/group /workspace/extra /workspace/secrets && \
     chown -R node:node /workspace && \
     chmod 777 /home/node
 
 USER node
-WORKDIR /workspace/group
+WORKDIR /workspace/agent
 
 # tini is PID 1, reaps zombies, forwards signals cleanly. entrypoint.sh does
 # `exec bun ...` so bun runs as tini's direct child.
