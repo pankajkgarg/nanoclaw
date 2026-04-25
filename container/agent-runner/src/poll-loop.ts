@@ -160,7 +160,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds);
+      const result = await processQuery(query, routing, processingIds, config.provider.supportsNativeSlashCommands);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
@@ -238,6 +238,7 @@ async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
+  nativeSlashCommands: boolean,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -267,7 +268,7 @@ async function processQuery(
       const newIds = newMessages.map((m) => m.id);
       markProcessing(newIds);
 
-      const prompt = formatMessages(newMessages);
+      const prompt = formatMessagesWithCommands(newMessages, nativeSlashCommands);
       log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
       query.push(prompt);
 

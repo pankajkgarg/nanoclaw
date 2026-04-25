@@ -5,8 +5,10 @@
  */
 import { createTelegramAdapter } from '@chat-adapter/telegram';
 
+import { getTelegramBotCommands } from '../command-catalog.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { getDb, hasTable } from '../db/connection.js';
 import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../db/messaging-groups.js';
 import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
@@ -57,6 +59,59 @@ async function fetchBotUsername(token: string): Promise<string | null> {
   } catch (err) {
     log.warn('Telegram getMe failed', { err });
     return null;
+  }
+}
+
+export async function installTelegramCommandMenu(token: string, fetchImpl: typeof fetch = fetch): Promise<void> {
+  const publicCommands = getTelegramBotCommands();
+  const adminCommands = getTelegramBotCommands({ includeAdmin: true });
+
+  async function setCommands(
+    commands: Array<{ command: string; description: string }>,
+    scope?: Record<string, string>,
+  ): Promise<void> {
+    if (commands.length === 0) return;
+    const res = await fetchImpl(`https://api.telegram.org/bot${token}/setMyCommands`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(scope ? { commands, scope } : { commands }),
+    });
+    if (!res.ok) {
+      log.warn('Telegram setMyCommands non-OK', { status: res.status, scope });
+    }
+  }
+
+  try {
+    await setCommands(publicCommands);
+    for (const chatId of getTelegramAdminPrivateChatIds()) {
+      await setCommands(adminCommands, { type: 'chat', chat_id: chatId });
+    }
+  } catch (err) {
+    log.warn('Telegram setMyCommands failed', { err });
+  }
+}
+
+function getTelegramAdminPrivateChatIds(): string[] {
+  try {
+    const db = getDb();
+    if (!hasTable(db, 'user_roles') || !hasTable(db, 'messaging_groups')) return [];
+    const rows = db
+      .prepare(
+        `SELECT DISTINCT substr(ur.user_id, length('telegram:') + 1) AS chat_id
+         FROM user_roles ur
+         JOIN messaging_groups mg
+           ON mg.channel_type = 'telegram'
+          AND mg.platform_id = ur.user_id
+          AND mg.is_group = 0
+         WHERE ur.user_id LIKE 'telegram:%'
+           AND ur.role IN ('owner', 'admin')
+         ORDER BY chat_id`,
+      )
+      .all() as Array<{ chat_id: string }>;
+    return rows.map((row) => row.chat_id).filter(Boolean);
+  } catch (err) {
+    log.warn('Telegram admin command menu scope lookup failed', { err });
+    return [];
   }
 }
 
@@ -221,7 +276,8 @@ registerChannelAdapter('telegram', {
           ...hostConfig,
           onInbound: createPairingInterceptor(botUsernamePromise, hostConfig.onInbound, token),
         };
-        return withRetry(() => bridge.setup(intercepted), 'bridge.setup');
+        await withRetry(() => bridge.setup(intercepted), 'bridge.setup');
+        void installTelegramCommandMenu(token);
       },
     };
     return wrapped;

@@ -18,6 +18,7 @@
  * for policy refusals.
  */
 import { getChannelAdapter } from './channels/channel-registry.js';
+import { formatCommandHelp, getCommandAliasMap } from './command-catalog.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
@@ -27,6 +28,7 @@ import {
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
 import { findSessionForAgent } from './db/sessions.js';
+import { deliverSessionMessages } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
@@ -134,6 +136,28 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
     return JSON.parse(raw);
   } catch {
     return { text: raw };
+  }
+}
+
+function normalizeKnownCommandAlias(content: string, agentGroup: AgentGroup): string {
+  const rewrite = (text: string): string => {
+    const trimmed = text.trimStart();
+    if (!trimmed.startsWith('/')) return text;
+    const leadingWhitespace = text.slice(0, text.length - trimmed.length);
+    const [command, ...rest] = trimmed.split(/\s+/);
+    const canonical = getCommandAliasMap(agentGroup).get(command.toLowerCase());
+    if (!canonical) return text;
+    return `${leadingWhitespace}${canonical}${rest.length > 0 ? ` ${rest.join(' ')}` : ''}`;
+  };
+
+  try {
+    const parsed = JSON.parse(content) as { text?: unknown };
+    if (typeof parsed.text !== 'string') return content;
+    const normalized = rewrite(parsed.text);
+    if (normalized === parsed.text) return content;
+    return JSON.stringify({ ...parsed, text: normalized });
+  } catch {
+    return rewrite(content);
   }
 }
 
@@ -398,14 +422,28 @@ async function deliverToAgent(
     platformId: event.platformId,
     threadId: event.threadId,
   };
+  const messageContent = normalizeKnownCommandAlias(event.message.content, agentGroup);
 
   // Command gate: classify slash commands before they reach the container.
   // Filtered commands are dropped silently. Denied admin commands get a
   // permission-denied response written directly to messages_out.
   if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
+    const gate = gateCommand(messageContent, userId, agent.agent_group_id);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
+      return;
+    }
+    if (gate.action === 'help') {
+      writeOutboundDirect(session.agent_group_id, session.id, {
+        id: `help-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        kind: 'chat',
+        platformId: deliveryAddr.platformId,
+        channelType: deliveryAddr.channelType,
+        threadId: deliveryAddr.threadId,
+        content: JSON.stringify({ text: formatCommandHelp(agentGroup, { includeAdmin: gate.includeAdmin }) }),
+      });
+      await deliverSessionMessages(session);
+      log.info('Command help sent by gate', { userId, agentGroupId: agent.agent_group_id });
       return;
     }
     if (gate.action === 'deny') {
@@ -417,6 +455,7 @@ async function deliverToAgent(
         threadId: deliveryAddr.threadId,
         content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
       });
+      await deliverSessionMessages(session);
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
       return;
     }
@@ -429,7 +468,7 @@ async function deliverToAgent(
     platformId: deliveryAddr.platformId,
     channelType: deliveryAddr.channelType,
     threadId: deliveryAddr.threadId,
-    content: event.message.content,
+    content: messageContent,
     trigger: wake ? 1 : 0,
   });
 

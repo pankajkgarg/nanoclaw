@@ -35,6 +35,10 @@ vi.mock('./container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
+vi.mock('./delivery.js', () => ({
+  deliverSessionMessages: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Override DATA_DIR for tests
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
@@ -242,6 +246,99 @@ describe('router', () => {
 
     // Verify container was woken
     expect(wakeContainer).toHaveBeenCalled();
+  });
+
+  it('handles /help directly without waking the container', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const { deliverSessionMessages } = await import('./delivery.js');
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (deliverSessionMessages as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    await routeInbound({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      message: {
+        id: 'msg-help',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'User', text: '/help' }),
+        timestamp: now(),
+      },
+    });
+
+    const session = findSession('mg-1', null);
+    expect(session).toBeDefined();
+
+    const inDb = new Database(inboundDbPath('ag-1', session!.id));
+    const inboundRows = inDb.prepare('SELECT * FROM messages_in').all();
+    inDb.close();
+    expect(inboundRows).toHaveLength(0);
+
+    const outDb = new Database(outboundDbPath('ag-1', session!.id));
+    const outboundRows = outDb.prepare('SELECT content FROM messages_out').all() as Array<{ content: string }>;
+    outDb.close();
+
+    expect(wakeContainer).not.toHaveBeenCalled();
+    expect(deliverSessionMessages).toHaveBeenCalledOnce();
+    expect(JSON.parse(outboundRows[0].content).text).toContain('Available commands:');
+    expect(JSON.parse(outboundRows[0].content).text).toContain('/help - Show available commands.');
+  });
+
+  it('passes unknown slash commands through to Claude', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    await routeInbound({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      message: {
+        id: 'msg-random-command',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'User', text: '/notreal' }),
+        timestamp: now(),
+      },
+    });
+
+    const session = findSession('mg-1', null);
+    const db = new Database(inboundDbPath('ag-1', session!.id));
+    const rows = db.prepare('SELECT content FROM messages_in').all() as Array<{ content: string }>;
+    db.close();
+
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0].content).text).toBe('/notreal');
+    expect(wakeContainer).toHaveBeenCalled();
+  });
+
+  it('keeps unauthorized admin commands gated', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const { deliverSessionMessages } = await import('./delivery.js');
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (deliverSessionMessages as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    await routeInbound({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      message: {
+        id: 'msg-clear',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'User', text: '/clear' }),
+        timestamp: now(),
+      },
+    });
+
+    const session = findSession('mg-1', null);
+    const outDb = new Database(outboundDbPath('ag-1', session!.id));
+    const outboundRows = outDb.prepare('SELECT content FROM messages_out').all() as Array<{ content: string }>;
+    outDb.close();
+
+    expect(wakeContainer).not.toHaveBeenCalled();
+    expect(deliverSessionMessages).toHaveBeenCalledOnce();
+    expect(JSON.parse(outboundRows[0].content).text).toBe('Permission denied: /clear requires admin access.');
   });
 
   it('auto-creates messaging group only when the bot is addressed (mention/DM)', async () => {
