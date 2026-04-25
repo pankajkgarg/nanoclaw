@@ -10,6 +10,7 @@ import { DATA_DIR } from './config.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
+import { readEnvFile } from './env.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
@@ -158,6 +159,19 @@ async function main(): Promise<void> {
   // 6. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
+
+  // 7. Dashboard (optional)
+  const dashboardEnv = readEnvFile(['DASHBOARD_SECRET', 'DASHBOARD_PORT']);
+  const dashboardSecret = process.env.DASHBOARD_SECRET || dashboardEnv.DASHBOARD_SECRET;
+  const dashboardPort = parseInt(process.env.DASHBOARD_PORT || dashboardEnv.DASHBOARD_PORT || '3100', 10);
+  if (dashboardSecret) {
+    const { startDashboard } = await import('@nanoco/nanoclaw-dashboard');
+    const { startDashboardPusher } = await import('./dashboard-pusher.js');
+    startDashboard({ port: dashboardPort, secret: dashboardSecret });
+    startDashboardPusher({ port: dashboardPort, secret: dashboardSecret, intervalMs: 60000 });
+  } else {
+    log.info('Dashboard disabled (no DASHBOARD_SECRET)');
+  }
 
   log.info('NanoClaw running');
 }
