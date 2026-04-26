@@ -161,7 +161,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
       const result = await processQuery(query, routing, processingIds, config.provider.supportsNativeSlashCommands);
-      if (result.continuation && result.continuation !== continuation) {
+      if (result.clearedSession) {
+        continuation = undefined;
+      } else if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
       }
@@ -232,6 +234,7 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
 
 interface QueryResult {
   continuation?: string;
+  clearedSession?: boolean;
 }
 
 async function processQuery(
@@ -241,6 +244,7 @@ async function processQuery(
   nativeSlashCommands: boolean,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
+  let clearedSession = false;
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
@@ -252,18 +256,41 @@ async function processQuery(
   const pollHandle = setInterval(() => {
     if (done) return;
 
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
+    // Skip system messages (MCP tool responses).
     // Thread routing is the router's concern — if a message landed in this
     // session, the agent should see it. Per-thread sessions already isolate
     // threads into separate containers; shared sessions intentionally merge
     // everything. Filtering on thread_id here caused deadlocks when the
     // initial batch and follow-ups had mismatched thread_ids (e.g. a
     // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => {
+    const pendingMessages = getPendingMessages().filter((m) => {
       if (m.kind === 'system') return false;
-      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
       return true;
     });
+
+    const clearMessages = pendingMessages.filter((m) => (m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m));
+    if (clearMessages.length > 0) {
+      const clearIds = clearMessages.map((m) => m.id);
+      markProcessing(clearIds);
+      clearStoredSessionId();
+      writeMessageOut({
+        id: generateId(),
+        kind: 'chat',
+        platform_id: routing.platformId,
+        channel_type: routing.channelType,
+        thread_id: routing.threadId,
+        content: JSON.stringify({ text: 'Session cleared.' }),
+      });
+      markCompleted(clearIds);
+      queryContinuation = undefined;
+      clearedSession = true;
+      done = true;
+      log('Clearing active session (aborting current query)');
+      query.abort();
+      return;
+    }
+
+    const newMessages = pendingMessages;
     if (newMessages.length > 0) {
       const newIds = newMessages.map((m) => m.id);
       markProcessing(newIds);
@@ -308,7 +335,7 @@ async function processQuery(
     clearInterval(pollHandle);
   }
 
-  return { continuation: queryContinuation };
+  return { continuation: queryContinuation, clearedSession };
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
