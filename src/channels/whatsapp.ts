@@ -1,8 +1,8 @@
 /**
- * WhatsApp channel adapter (v2) — native Baileys v6 implementation.
+ * WhatsApp channel adapter (v2) — native Baileys v7 implementation.
  *
  * Implements ChannelAdapter directly (no Chat SDK bridge) using
- * @whiskeysockets/baileys v6 (stable). Ports proven v1 infrastructure:
+ * @whiskeysockets/baileys v7. Ports proven v1 infrastructure:
  * getMessage fallback, outgoing queue, group metadata cache, LID mapping,
  * reconnection with backoff.
  *
@@ -28,6 +28,7 @@ import {
   downloadMediaMessage,
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
+  proto,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 import type { GroupMetadata, WAMessageKey, WAMessage, WASocket } from '@whiskeysockets/baileys';
@@ -38,27 +39,6 @@ import { log } from '../log.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundMessage, OutboundMessage } from './adapter.js';
-
-// Baileys v6 bug: getPlatformId sends charCode (49) instead of enum value (1).
-// Fixed in Baileys 7.x but not backported. Without this, pairing codes fail with
-// "couldn't link device" because WhatsApp receives an invalid platform ID.
-// Must use createRequire — ESM `import *` creates a read-only namespace.
-// proto is not available as a named ESM export — use createRequire (same as v1)
-import { createRequire } from 'module';
-const _require = createRequire(import.meta.url);
-const { proto } = _require('@whiskeysockets/baileys') as { proto: any };
-try {
-  const _generics = _require('@whiskeysockets/baileys/lib/Utils/generics') as Record<string, unknown>;
-  _generics.getPlatformId = (browser: string): string => {
-    const platformType =
-      proto.DeviceProps.PlatformType[browser.toUpperCase() as keyof typeof proto.DeviceProps.PlatformType];
-    return platformType ? platformType.toString() : '1';
-  };
-} catch {
-  // If CJS require fails (Node version mismatch), pairing codes may not work
-  // but QR auth will still function fine.
-  log.warn('Could not patch getPlatformId — pairing code auth may fail');
-}
 
 const baileysLogger = pino({ level: 'silent' });
 
@@ -217,12 +197,59 @@ registerChannelAdapter('whatsapp', {
       groupMetadataCache.clear();
     }
 
+    function normalizePhoneJid(jidOrPhone: string): string {
+      return `${jidOrPhone.split('@')[0].split(':')[0]}@s.whatsapp.net`;
+    }
+
+    function normalizeLidJid(jidOrLid: string): string {
+      return `${jidOrLid.split('@')[0].split(':')[0]}@lid`;
+    }
+
+    async function rememberLidPhoneMapping(lidJidOrUser: string, phoneJidOrUser: string): Promise<void> {
+      const lidJid = normalizeLidJid(lidJidOrUser);
+      const phoneJid = normalizePhoneJid(phoneJidOrUser);
+      setLidPhoneMapping(lidJid.split('@')[0], phoneJid);
+      try {
+        await sock?.signalRepository?.lidMapping?.storeLIDPNMappings([{ lid: lidJid, pn: phoneJid }]);
+      } catch (err) {
+        log.debug('Failed to persist WhatsApp LID mapping', { lidJid, phoneJid, err });
+      }
+    }
+
+    async function persistKnownLidMappings(): Promise<void> {
+      const pairs = Object.entries(lidToPhoneMap).map(([lidUser, phoneJid]) => ({
+        lid: `${lidUser}@lid`,
+        pn: phoneJid,
+      }));
+      if (pairs.length === 0) return;
+      try {
+        await sock?.signalRepository?.lidMapping?.storeLIDPNMappings(pairs);
+      } catch (err) {
+        log.debug('Failed to persist configured WhatsApp LID mappings', { count: pairs.length, err });
+      }
+    }
+
+    async function rememberGroupLidMappings(metadata: GroupMetadata): Promise<void> {
+      const tasks: Array<Promise<void>> = [];
+      for (const participant of metadata.participants) {
+        if (participant.id?.endsWith('@lid') && participant.phoneNumber?.endsWith('@s.whatsapp.net')) {
+          tasks.push(rememberLidPhoneMapping(participant.id, participant.phoneNumber));
+        } else if (participant.id?.endsWith('@s.whatsapp.net') && participant.lid?.endsWith('@lid')) {
+          tasks.push(rememberLidPhoneMapping(participant.lid, participant.id));
+        }
+      }
+      if (metadata.owner?.endsWith('@lid') && metadata.ownerPn?.endsWith('@s.whatsapp.net')) {
+        tasks.push(rememberLidPhoneMapping(metadata.owner, metadata.ownerPn));
+      }
+      await Promise.all(tasks);
+    }
+
     for (const entry of (env.WHATSAPP_LID_MAP ?? '').split(',')) {
       const [lid, phone] = entry
         .split(':')
         .map((s) => s?.trim())
         .filter(Boolean);
-      if (lid && phone) setLidPhoneMapping(lid, `${phone.split('@')[0]}@s.whatsapp.net`);
+      if (lid && phone) setLidPhoneMapping(normalizeLidJid(lid).split('@')[0], normalizePhoneJid(phone));
     }
 
     async function translateJid(jid: string): Promise<string> {
@@ -237,8 +264,8 @@ registerChannelAdapter('whatsapp', {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const pn = await (sock.signalRepository as any)?.lidMapping?.getPNForLID(jid);
         if (pn) {
-          const phoneJid = `${pn.split('@')[0].split(':')[0]}@s.whatsapp.net`;
-          setLidPhoneMapping(lidUser, phoneJid);
+          const phoneJid = normalizePhoneJid(pn);
+          await rememberLidPhoneMapping(jid, phoneJid);
           log.info('Translated LID to phone JID', { lidJid: jid, phoneJid });
           return phoneJid;
         }
@@ -255,23 +282,8 @@ registerChannelAdapter('whatsapp', {
       const cached = groupMetadataCache.get(jid);
       if (cached && cached.expiresAt > Date.now()) return cached.metadata;
 
-      const metadata = await sock.groupMetadata(jid);
-      const participantsWithLids = await Promise.all(
-        metadata.participants.map(async (p) => ({
-          ...p,
-          id: await translateJid(p.id),
-        })),
-      );
-      const participants = participantsWithLids.filter((p) => !p.id.endsWith('@lid'));
-      const unresolved = participantsWithLids.length - participants.length;
-      if (unresolved > 0) {
-        log.warn('Filtered unresolved WhatsApp LID participants from group metadata', {
-          jid,
-          unresolved,
-          kept: participants.length,
-        });
-      }
-      const normalized = { ...metadata, participants };
+      const normalized = await sock.groupMetadata(jid);
+      await rememberGroupLidMappings(normalized);
       groupMetadataCache.set(jid, {
         metadata: normalized,
         expiresAt: Date.now() + GROUP_METADATA_CACHE_TTL_MS,
@@ -288,6 +300,7 @@ registerChannelAdapter('whatsapp', {
         const groups = await sock.groupFetchAllParticipating();
         let count = 0;
         for (const [jid, metadata] of Object.entries(groups)) {
+          await rememberGroupLidMappings(metadata);
           if (metadata.subject) {
             setupConfig.onMetadata(jid, metadata.subject, true);
             count++;
@@ -307,7 +320,7 @@ registerChannelAdapter('whatsapp', {
         log.info('Flushing outgoing message queue', { count: outgoingQueue.length });
         while (outgoingQueue.length > 0) {
           const item = outgoingQueue.shift()!;
-          const sent = await sock.sendMessage(item.jid, { text: item.text });
+          const sent = await sock.sendMessage(item.jid, { text: item.text }, { useCachedGroupMetadata: false });
           if (sent?.key?.id && sent.message) {
             sentMessageCache.set(sent.key.id, sent.message);
           }
@@ -356,7 +369,7 @@ registerChannelAdapter('whatsapp', {
         return;
       }
       try {
-        const sent = await sock.sendMessage(jid, { text });
+        const sent = await sock.sendMessage(jid, { text }, { useCachedGroupMetadata: false });
         if (sent?.key?.id && sent.message) {
           sentMessageCache.set(sent.key.id, sent.message);
           if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
@@ -482,6 +495,7 @@ registerChannelAdapter('whatsapp', {
               botPhoneUser = phoneUser;
             }
           }
+          persistKnownLidMappings().catch((err) => log.debug('Failed to store known LID mappings', { err }));
 
           // Flush queued messages
           flushOutgoingQueue().catch((err) => log.error('Failed to flush outgoing queue', { err }));
@@ -506,10 +520,11 @@ registerChannelAdapter('whatsapp', {
 
       sock.ev.on('creds.update', saveCreds);
 
-      // Phone number sharing events — update LID mapping
-      sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
-        const lidUser = lid?.split('@')[0].split(':')[0];
-        if (lidUser && jid) setLidPhoneMapping(lidUser, jid);
+      // LID mapping events — keep local cache aligned with Baileys' Signal store.
+      sock.ev.on('lid-mapping.update', ({ lid, pn }) => {
+        rememberLidPhoneMapping(lid, pn).catch((err) => {
+          log.debug('Failed to remember WhatsApp LID mapping update', { lid, pn, err });
+        });
       });
 
       // Inbound messages
@@ -521,6 +536,12 @@ registerChannelAdapter('whatsapp', {
             if (!normalized) continue;
             const rawJid = msg.key.remoteJid;
             if (!rawJid || rawJid === 'status@broadcast') continue;
+            if (msg.key.participantAlt && msg.key.participant?.endsWith('@lid')) {
+              await rememberLidPhoneMapping(msg.key.participant, msg.key.participantAlt);
+            }
+            if (msg.key.remoteJidAlt && rawJid.endsWith('@lid')) {
+              await rememberLidPhoneMapping(rawJid, msg.key.remoteJidAlt);
+            }
 
             // Translate LID → phone JID
             let chatJid = await translateJid(rawJid);
@@ -528,8 +549,8 @@ registerChannelAdapter('whatsapp', {
             if (chatJid.endsWith('@lid') && (msg.key as any).senderPn) {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               const pn = (msg.key as any).senderPn as string;
-              const phoneJid = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`;
-              setLidPhoneMapping(rawJid.split('@')[0].split(':')[0], phoneJid);
+              const phoneJid = normalizePhoneJid(pn);
+              await rememberLidPhoneMapping(rawJid, phoneJid);
               chatJid = phoneJid;
             }
 
@@ -699,7 +720,7 @@ registerChannelAdapter('whatsapp', {
               const ext = path.extname(file.filename).toLowerCase();
               const caption = !captionUsed ? text : undefined;
               const mediaMsg = buildMediaMessage(file.data, file.filename, ext, caption);
-              const sent = await sock.sendMessage(platformId, mediaMsg);
+              const sent = await sock.sendMessage(platformId, mediaMsg, { useCachedGroupMetadata: false });
               if (sent?.key?.id && sent.message) {
                 sentMessageCache.set(sent.key.id, sent.message);
               }
