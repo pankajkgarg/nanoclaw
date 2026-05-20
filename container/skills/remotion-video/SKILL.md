@@ -83,11 +83,12 @@ pnpm exec remotion render src/index.tsx Main static_loop.mp4 \
 - Use absolute paths or `public/` plus `staticFile()` for images/audio.
 - For a 5s title card, animate opacity with `interpolate(frame, [0, 12, 113, 125], [0, 1, 1, 0])`.
 - For multi-image slideshows, segment by frame ranges, overlap 30-40 frames, and crossfade opacity.
+- For long ambient videos, render only a short loop tile: normally 30-180s, hard max 300s. Use ffmpeg after render to stream-copy that tile to the target duration.
 - Use ffmpeg after render for long loops, compression, and final audio muxing.
 
 ## Pitfalls
 
 - Render into `/workspace/agent/<project>/`, not `/tmp`.
 - Use `--browser-executable=/usr/bin/chromium` if Chromium is not auto-detected.
-- For long ambient videos, render a short clean loop in Remotion, then loop with ffmpeg.
+- Never render the full 30-60 minute ambient video in Remotion. Render a short clean loop in Remotion, then loop with `ffmpeg -stream_loop -1 -c copy`.
 - Check file size before sending over messaging channels.

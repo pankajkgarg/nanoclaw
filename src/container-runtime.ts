@@ -2,7 +2,7 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
@@ -10,6 +10,9 @@ import { log } from './log.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
+
+const CONTAINER_RUNTIME_CHECK_TIMEOUT_MS = 10_000;
+const CONTAINER_RUNTIME_CLEANUP_TIMEOUT_MS = 10_000;
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
@@ -30,15 +33,18 @@ export function stopContainer(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
-  execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
+  execFileSync(CONTAINER_RUNTIME_BIN, ['stop', '-t', '1', name], {
+    stdio: 'pipe',
+    timeout: 10_000,
+  });
 }
 
 /** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
   try {
-    execSync(`${CONTAINER_RUNTIME_BIN} info`, {
+    execFileSync(CONTAINER_RUNTIME_BIN, ['info'], {
       stdio: 'pipe',
-      timeout: 10000,
+      timeout: CONTAINER_RUNTIME_CHECK_TIMEOUT_MS,
     });
     log.debug('Container runtime already running');
   } catch (err) {
@@ -66,11 +72,13 @@ export function ensureContainerRuntimeRunning(): void {
  */
 export function cleanupOrphans(): void {
   try {
-    const output = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
+    const output = execFileSync(
+      CONTAINER_RUNTIME_BIN,
+      ['ps', '--filter', `label=${CONTAINER_INSTALL_LABEL}`, '--format', '{{.Names}}'],
       {
         stdio: ['pipe', 'pipe', 'pipe'],
         encoding: 'utf-8',
+        timeout: CONTAINER_RUNTIME_CLEANUP_TIMEOUT_MS,
       },
     );
     const orphans = output.trim().split('\n').filter(Boolean);

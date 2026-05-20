@@ -200,22 +200,35 @@ with urllib.request.urlopen(req) as r:
 
 ### STEP 6: Assemble Final Video
 
+**Critical performance rule:** never render Ken Burns, xfade, zoompan, or Remotion over the full target duration. Render a short visual loop tile only, normally 30-180s and hard max 300s, then extend that tile with FFmpeg stream copy. A 30-60 minute video should spend minutes on visual rendering, not half an hour re-encoding frames.
+
 #### 6a. Send a preview
 * Prepare a 30-45s (round off to integer multiple of video length) preview with looping as needed and confirm with user that it looks good and should full video be uploaded. Only then prepare a full length video and upload to youtube. 
 * Mix with music before sending the video. 
 
-#### 6b. Loop video to target duration
+#### 6b. Render the short loop tile
+
+For static/Ken Burns videos:
+- Use Remotion only for `loop_tile.mp4`, not the final duration.
+- If there are multiple images, include the image sequence, zoom/pan, and crossfades inside this short tile.
+- Keep `loop_tile.mp4` to 30-180s; use 300s only when the user explicitly needs a longer visual cycle.
+- Do not use ffmpeg `zoompan`, `xfade`, or PIL frame generation for the full final length.
+
+For animated videos:
+- Build `seamless_loop.mp4` from the generated animation and bridge clip, then optionally add a static hold inside the tile.
 
 * If the video is of "animated" style and not built using effects on static images, then between video loops, keep an equal length of static chosen hero image. 
   * So one whole loop would be => (two videos generated through AI joined) + hero image (time length = one part of video generated through fal)
 
-If the source is already a rendered static/seamless H.264 MP4 from Remotion, do **not** use Remotion to extend its duration and do **not** re-encode. Use FFmpeg stream copy.
+#### 6c. Loop video to target duration
+
+If the source is already a rendered static/seamless H.264 MP4 from Remotion or Kling, do **not** use Remotion to extend its duration and do **not** re-encode the video. Use FFmpeg stream copy.
 
 This is much faster in CPU-only Docker on MacBook Air M processor series because it remuxes/copies encoded packets instead of rendering every frame again.
 
 ```bash
 DURATION=$((10 * 60))       # target duration in seconds
-SOURCE="static_loop.mp4"    # or seamless_loop.mp4
+SOURCE="loop_tile.mp4"      # or static_loop.mp4 / seamless_loop.mp4
 OUT="video_looped.mp4"
 
 ffmpeg -y \
@@ -225,13 +238,15 @@ ffmpeg -y \
   -c copy \
   -movflags +faststart \
   "$OUT"
-  
-  
-#### 6c. Add title card (first 5 seconds)
+```
+
+This command should finish quickly. If it is still running after a few minutes for a 30-60 minute video, stop and inspect the command; it is probably re-encoding.
+
+#### 6d. Add title card (first 5 seconds)
 
 Use the **remotion-video** skill for title cards. Render `title_card.mp4` as a 5s composition over `hero.jpg`, with title/subtitle opacity fade-in/out. Then prepend it to `video_looped.mp4` using ffmpeg concat demuxer/remotion. Result: `video_titled.mp4`.
 
-#### 6c. Mix with music
+#### 6e. Mix with music
 Example command
 
 ```bash
@@ -316,8 +331,8 @@ python3 /workspace/set_thumbnail.py \
 | Type | When | Approach |
 |------|------|----------|
 | Ambient/instrumental | Looping visuals + music (meditation, relaxation) | Hero image → seamless loop → Suno music → loop to duration |
-| Static image video | User chooses cheaper option | Hero image → Ken Burns zoom → Suno music → loop to duration |
-| Multi-scene montage | Multiple distinct scenes with transitions | Generate N images → animate each → xfade transitions + music |
+| Static image video | User chooses cheaper option | Hero image(s) → short Ken Burns loop tile → stream-copy to duration → music |
+| Multi-scene montage | Multiple distinct scenes with transitions | Generate N images → short montage loop tile with transitions → stream-copy to duration → music |
 | YouTube-style recreation | Recreate style of a reference video | youtube-understand skill → analyze → recreate visuals + matching music |
 
 ## Image Generation Pitfalls (fal.ai content policy)
@@ -334,7 +349,9 @@ python3 /workspace/set_thumbnail.py \
 - Kling v3 Pro takes 1-3 min per 5s clip — inform user
 - fal.ai balance can run out — check before generating, inform user if empty
 - Suno tracks max ~3-8 min; loop with crossfade for longer videos
-- For 30min+ videos, ffmpeg `stream_loop -1 -c copy` avoids re-encoding
+- For 30min+ videos, ffmpeg `stream_loop -1 -c copy` avoids re-encoding; this is mandatory for final visual extension
+- Never run `xfade`, `zoompan`, Remotion, or frame-by-frame Python over the full target duration
+- If an MP4 is killed before finalization it may be huge but unusable because the `moov` atom is missing; use short tiles and stream-copy loops to avoid this
 - Always `generate_audio: false` in Kling when adding separate music
 - Title card: use Remotion opacity animation over the hero image, NOT a separate black frame
 - Audio: always add fade-out in last 5 seconds with `-af afade`
