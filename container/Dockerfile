@@ -124,7 +124,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
 ENV REMOTION_HOME="/opt/remotion"
-ENV PATH="$REMOTION_HOME/bin:$PNPM_HOME:$PATH"
+ENV PATH="$REMOTION_HOME/bin:$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 ENV NODE_PATH="$REMOTION_HOME/lib/node_modules"
 RUN corepack enable
 
@@ -137,7 +137,9 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
-    pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+    pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && \
+    INSTALL_CJS=$(ls /pnpm/global/v11/*/node_modules/@anthropic-ai/claude-code/install.cjs 2>/dev/null | head -1) && \
+    node "$INSTALL_CJS"
 
 RUN --mount=type=cache,target=/root/.npm \
     npm install -g --prefix "$REMOTION_HOME" \

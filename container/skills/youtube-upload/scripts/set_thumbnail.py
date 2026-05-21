@@ -14,6 +14,7 @@ Image requirements (YouTube spec):
 """
 
 import os, sys, json, argparse
+from datetime import datetime, timezone
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -28,9 +29,27 @@ SCOPES = [
 
 def save_credentials(raw, creds):
     raw["token"] = creds.token
-    raw["expiry"] = creds.expiry.isoformat() if creds.expiry else None
+    raw["expiry"] = format_expiry(creds.expiry)
     with open(CRED_PATH, "w") as f:
         json.dump(raw, f, indent=2)
+
+def parse_expiry(expiry_str):
+    if not expiry_str:
+        return None
+    try:
+        expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if expiry.tzinfo is not None:
+        expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+    return expiry
+
+def format_expiry(expiry):
+    if not expiry:
+        return None
+    if expiry.tzinfo is not None:
+        expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+    return expiry.isoformat()
 
 def get_credentials():
     with open(CRED_PATH) as f:
@@ -40,6 +59,8 @@ def get_credentials():
         print("ERROR: Credential file is not yet authorized. Run get_youtube_token.py first.")
         sys.exit(1)
 
+    expiry = parse_expiry(raw.get("expiry"))
+
     creds = Credentials(
         token=raw.get("token") or raw.get("access_token"),
         refresh_token=raw.get("refresh_token"),
@@ -47,6 +68,7 @@ def get_credentials():
         client_id=raw.get("client_id"),
         client_secret=raw.get("client_secret"),
         scopes=raw.get("scopes", SCOPES),
+        expiry=expiry,
     )
 
     if not creds.valid:

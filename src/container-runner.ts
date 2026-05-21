@@ -21,7 +21,13 @@ import {
   TIMEZONE,
 } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_RUNTIME_BIN,
+  ensureContainerRuntimeRunning,
+  hostGatewayArgs,
+  readonlyMountArgs,
+  stopContainer,
+} from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -56,7 +62,7 @@ export const MEDIA_CREDENTIAL_PLACEHOLDERS: Record<string, string> = {
 export const GOOGLE_OAUTH_CREDS_CONTAINER_PATH = '/workspace/secrets/mom_account_google_oauth_creds.json';
 
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeContainers = new Map<string, { process: ChildProcess; containerName: string; startedAtMs: number }>();
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -74,6 +80,10 @@ export function getActiveContainerCount(): number {
 
 export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
+}
+
+export function getContainerStartedAtMs(sessionId: string): number {
+  return activeContainers.get(sessionId)?.startedAtMs ?? 0;
 }
 
 /**
@@ -100,6 +110,8 @@ export function wakeContainer(session: Session): Promise<void> {
 }
 
 async function spawnContainer(session: Session): Promise<void> {
+  ensureContainerRuntimeRunning();
+
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     log.error('Agent group not found', { agentGroupId: session.agent_group_id });
@@ -155,7 +167,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, { process: container, containerName, startedAtMs: Date.now() });
   markContainerRunning(session.id);
 
   // Log stderr
@@ -194,6 +206,9 @@ export function killContainer(sessionId: string, reason: string): void {
   if (!entry) return;
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  activeContainers.delete(sessionId);
+  markContainerStopped(sessionId);
+  stopTypingRefresh(sessionId);
   try {
     stopContainer(entry.containerName);
   } catch {

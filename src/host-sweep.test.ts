@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, decideStuckAction } from './host-sweep.js';
+import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, STARTUP_STUCK_MS, decideStuckAction } from './host-sweep.js';
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -19,6 +19,8 @@ describe('decideStuckAction', () => {
       decideStuckAction({
         now: BASE,
         heartbeatMtimeMs: BASE - 5_000,
+        containerStartedAtMs: BASE - 10_000,
+        pendingDueCount: 0,
         containerState: null,
         claims: [],
       }),
@@ -30,6 +32,8 @@ describe('decideStuckAction', () => {
     const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs,
+      containerStartedAtMs: BASE - 10_000,
+      pendingDueCount: 0,
       containerState: null,
       claims: [],
     });
@@ -47,10 +51,24 @@ describe('decideStuckAction', () => {
     const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs: 0,
+      containerStartedAtMs: BASE - 10_000,
+      pendingDueCount: 0,
       containerState: null,
       claims: [],
     });
     expect(res.action).toBe('ok');
+  });
+
+  it('kills when startup grace expires with due work but no heartbeat or claims', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0,
+      containerStartedAtMs: BASE - STARTUP_STUCK_MS - 1_000,
+      pendingDueCount: 1,
+      containerState: null,
+      claims: [],
+    });
+    expect(res.action).toBe('kill-startup');
   });
 
   it('kills on claim-stuck when heartbeat is absent AND a claim has aged past tolerance', () => {
@@ -61,6 +79,8 @@ describe('decideStuckAction', () => {
     const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs: 0,
+      containerStartedAtMs: BASE - 10_000,
+      pendingDueCount: 1,
       containerState: null,
       claims: [claim('msg-1', claimedAgeMs)],
     });
@@ -73,6 +93,8 @@ describe('decideStuckAction', () => {
       now: BASE,
       // 45 min — over the default ceiling, but under the Bash timeout
       heartbeatMtimeMs: BASE - 45 * 60 * 1000,
+      containerStartedAtMs: BASE - 45 * 60 * 1000,
+      pendingDueCount: 0,
       containerState: {
         current_tool: 'Bash',
         tool_declared_timeout_ms: twoHrMs,
@@ -88,6 +110,8 @@ describe('decideStuckAction', () => {
     const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs: BASE - claimedAgeMs - 5_000, // older than the claim
+      containerStartedAtMs: BASE - claimedAgeMs - 10_000,
+      pendingDueCount: 1,
       containerState: null,
       claims: [claim('msg-1', claimedAgeMs)],
     });
@@ -102,6 +126,8 @@ describe('decideStuckAction', () => {
     const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs: BASE - 2_000, // fresh, updated after the claim
+      containerStartedAtMs: BASE - claimedAgeMs - 10_000,
+      pendingDueCount: 1,
       containerState: null,
       claims: [claim('msg-1', claimedAgeMs)],
     });
@@ -112,6 +138,8 @@ describe('decideStuckAction', () => {
     const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs: BASE - CLAIM_STUCK_MS - 10_000, // old, but claim is recent
+      containerStartedAtMs: BASE - CLAIM_STUCK_MS - 20_000,
+      pendingDueCount: 1,
       containerState: null,
       claims: [claim('msg-1', 5_000)],
     });
@@ -124,6 +152,8 @@ describe('decideStuckAction', () => {
       now: BASE,
       // 5 min since claim, over the 60s default but under the declared Bash timeout
       heartbeatMtimeMs: BASE - 5 * 60 * 1000 - 5_000,
+      containerStartedAtMs: BASE - 5 * 60 * 1000 - 10_000,
+      pendingDueCount: 1,
       containerState: {
         current_tool: 'Bash',
         tool_declared_timeout_ms: tenMinMs,
@@ -138,6 +168,8 @@ describe('decideStuckAction', () => {
     const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs: BASE - 5_000,
+      containerStartedAtMs: BASE - 10_000,
+      pendingDueCount: 1,
       containerState: null,
       claims: [{ message_id: 'x', status_changed: 'not-a-date' }],
     });
@@ -148,6 +180,8 @@ describe('decideStuckAction', () => {
     const res = decideStuckAction({
       now: Date.parse('2026-04-24T21:50:55.000Z'),
       heartbeatMtimeMs: 0,
+      containerStartedAtMs: Date.parse('2026-04-24T21:50:54.000Z'),
+      pendingDueCount: 1,
       containerState: null,
       claims: [{ message_id: 'msg-utc', status_changed: '2026-04-24 21:50:54' }],
     });

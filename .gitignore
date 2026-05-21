@@ -12,6 +12,7 @@ data/
 logs/
 
 # Groups - per-installation state, not tracked
+groups
 groups/*
 
 # Composer-managed CLAUDE.md artifacts (regenerated every spawn) and

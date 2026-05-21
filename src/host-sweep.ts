@@ -43,7 +43,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
-import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { getContainerStartedAtMs, isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
@@ -54,11 +54,16 @@ export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
+// Grace for a freshly-spawned runtime process to start the agent runner and
+// either touch heartbeat or claim due work. Past this, no heartbeat + no
+// claims means the runtime client is likely wedged before the container began.
+export const STARTUP_STUCK_MS = 2 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
 export type StuckDecision =
   | { action: 'ok' }
+  | { action: 'kill-startup'; startupAgeMs: number; graceMs: number }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
@@ -70,11 +75,20 @@ export type StuckDecision =
 export function decideStuckAction(args: {
   now: number;
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
+  containerStartedAtMs: number; // 0 when unknown/untracked
+  pendingDueCount: number;
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerStartedAtMs, pendingDueCount, containerState, claims } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
+
+  if (heartbeatMtimeMs === 0 && claims.length === 0 && pendingDueCount > 0 && containerStartedAtMs !== 0) {
+    const startupAgeMs = now - containerStartedAtMs;
+    if (startupAgeMs > STARTUP_STUCK_MS) {
+      return { action: 'kill-startup', startupAgeMs, graceMs: STARTUP_STUCK_MS };
+    }
+  }
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
   // A freshly-spawned container hasn't had any SDK activity yet so no
@@ -186,7 +200,7 @@ async function sweepSession(session: Session): Promise<void> {
 
     // 3. Running-container SLA: absolute ceiling + per-claim stuck rules.
     if (alive && outDb) {
-      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
+      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id, dueCount);
     }
 
     // 4. Crashed-container cleanup: processing rows left behind get retried.
@@ -227,16 +241,29 @@ function enforceRunningContainerSla(
   outDb: Database.Database,
   session: Session,
   agentGroupId: string,
+  pendingDueCount: number,
 ): void {
   const claims = getProcessingClaims(outDb).filter(({ message_id }) => getMessageForRetry(inDb, message_id, 'pending'));
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
+    containerStartedAtMs: getContainerStartedAtMs(session.id),
+    pendingDueCount,
     containerState: getContainerState(outDb),
     claims,
   });
 
   if (decision.action === 'ok') return;
+
+  if (decision.action === 'kill-startup') {
+    log.warn('Killing container that never started processing', {
+      sessionId: session.id,
+      startupAgeMs: decision.startupAgeMs,
+      graceMs: decision.graceMs,
+    });
+    killContainer(session.id, 'startup-stuck');
+    return;
+  }
 
   if (decision.action === 'kill-ceiling') {
     log.warn('Killing container past absolute ceiling', {

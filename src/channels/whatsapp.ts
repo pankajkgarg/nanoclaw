@@ -48,6 +48,8 @@ const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
 const SENT_MESSAGE_CACHE_MAX = 256;
 const RECONNECT_DELAY_MS = 5000;
 const PENDING_QUESTIONS_MAX = 64;
+const WA_VERSION_FETCH_TIMEOUT_MS = 5000;
+const FIRST_OPEN_TIMEOUT_MS = 30_000;
 
 function hasRegisteredWhatsAppAuth(authDir: string): boolean {
   try {
@@ -57,6 +59,12 @@ function hasRegisteredWhatsAppAuth(authDir: string): boolean {
   } catch {
     return false;
   }
+}
+
+function timeoutPromise<T>(ms: number, message: string): Promise<T> {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(message)), ms);
+  });
 }
 
 /** Normalize an option label to a slash command: "Approve" → "/approve" */
@@ -390,7 +398,10 @@ registerChannelAdapter('whatsapp', {
     async function connectSocket(): Promise<void> {
       const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-      const { version } = await fetchLatestWaWebVersion({}).catch((err) => {
+      const { version } = await Promise.race([
+        fetchLatestWaWebVersion({}),
+        timeoutPromise<{ version: undefined }>(WA_VERSION_FETCH_TIMEOUT_MS, 'Timed out fetching WA Web version'),
+      ]).catch((err) => {
         log.warn('Failed to fetch latest WA Web version, using default', { err });
         return { version: undefined };
       });
@@ -651,13 +662,23 @@ registerChannelAdapter('whatsapp', {
         setupConfig = hostConfig;
 
         // Connect and wait for first open
-        await new Promise<void>((resolve, reject) => {
-          resolveFirstOpen = resolve;
-          rejectFirstOpen = reject;
-          connectSocket().catch(reject);
+        await Promise.race([
+          new Promise<void>((resolve, reject) => {
+            resolveFirstOpen = resolve;
+            rejectFirstOpen = reject;
+            connectSocket().catch(reject);
+          }),
+          timeoutPromise<void>(FIRST_OPEN_TIMEOUT_MS, 'Timed out waiting for WhatsApp first open'),
+        ]).catch((err) => {
+          log.warn('WhatsApp first open not ready; continuing startup', { err });
         });
 
-        log.info('WhatsApp adapter initialized');
+        if (!resolveFirstOpen && !rejectFirstOpen) {
+          log.info('WhatsApp adapter initialized');
+          return;
+        }
+
+        log.info('WhatsApp adapter initialized; connection still pending');
       },
 
       async deliver(

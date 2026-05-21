@@ -66,13 +66,20 @@ async function main(): Promise<void> {
   log.info('Central DB ready', { path: dbPath });
 
   // 1b. One-time filesystem cutover — idempotent, no-op after first run.
+  log.info('Running group filesystem migration');
   migrateGroupsToClaudeLocal();
+  log.info('Group filesystem migration complete');
 
   // 2. Container runtime
+  log.info('Checking container runtime');
   ensureContainerRuntimeRunning();
+  log.info('Container runtime ready');
+  log.info('Cleaning up orphaned containers');
   cleanupOrphans();
+  log.info('Orphan cleanup complete');
 
   // 3. Channel adapters
+  log.info('Starting channel adapters');
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
@@ -126,6 +133,7 @@ async function main(): Promise<void> {
       },
     };
   });
+  log.info('Channel adapters started');
 
   // 4. Delivery adapter bridge — dispatches to channel adapters
   const deliveryAdapter = {

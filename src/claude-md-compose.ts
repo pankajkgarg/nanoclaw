@@ -17,7 +17,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { GROUPS_DIR } from './config.js';
+import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { readContainerConfig } from './container-config.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
@@ -33,6 +33,7 @@ const SHARED_MCP_TOOLS_CONTAINER_BASE = '/app/src/mcp-tools';
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 
 const COMPOSED_HEADER = '<!-- Composed at spawn — do not edit. Edit CLAUDE.local.md for per-group content. -->';
+const GROUP_MIGRATION_MARKER = path.join(DATA_DIR, 'groups-claude-local-migration.done');
 
 /**
  * Regenerate `groups/<folder>/CLAUDE.md` from the shared base, enabled skill
@@ -144,6 +145,7 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
  *   - delete `groups/global/` (content already in `container/CLAUDE.md`)
  */
 export function migrateGroupsToClaudeLocal(): void {
+  if (fs.existsSync(GROUP_MIGRATION_MARKER)) return;
   if (!fs.existsSync(GROUPS_DIR)) return;
 
   const actions: string[] = [];
@@ -180,6 +182,7 @@ export function migrateGroupsToClaudeLocal(): void {
   if (actions.length > 0) {
     log.info('Migrated groups to CLAUDE.local.md model', { actions });
   }
+  fs.writeFileSync(GROUP_MIGRATION_MARKER, `${new Date().toISOString()}\n`);
 }
 
 function syncSymlink(linkPath: string, target: string): void {

@@ -77,7 +77,10 @@ Generate 2 images using fal-image skill (fal-ai/flux-2-pro, landscape_16_9).
 
 Craft vivid, specific prompts. See references/image-prompts.md for example templates — but always customize to the user's specific theme. Those are starting points, not a fixed set.
 
-Share both images with user. Ask which they prefer.
+Share both images with user.
+* In animated style: Ask which one they prefer, or new images should be generated.
+* In static mode: At least 2 images are needed, so ask if both are ok to make video, otherwise generate more.
+
 If user asks for more, generate additional options. Save all to the project folder.
 Save the chosen image as `hero.jpg`.
 
