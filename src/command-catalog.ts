@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { readContainerConfig } from './container-config.js';
+import { getContainerConfig } from './db/container-configs.js';
 import type { AgentGroup } from './types.js';
 
 export type CommandCategory = 'nanoclaw' | 'claude-code' | 'skill';
@@ -149,7 +149,11 @@ export function getSkillCommandEntries(options: CommandCatalogOptions = {}): Com
 
 export function getCommandCatalog(agentGroup?: AgentGroup, options: CommandCatalogOptions = {}): CommandEntry[] {
   const includeAdmin = options.includeAdmin ?? false;
-  const selectedSkills = options.selectedSkills ?? (agentGroup ? readContainerConfig(agentGroup.folder).skills : 'all');
+  const selectedSkills =
+    options.selectedSkills ??
+    (agentGroup && getContainerConfig(agentGroup.id)
+      ? (JSON.parse(getContainerConfig(agentGroup.id)!.skills) as string[] | 'all')
+      : 'all');
   const allCommands = [
     ...NANOCLAW_COMMANDS,
     ...CLAUDE_CODE_COMMANDS,
