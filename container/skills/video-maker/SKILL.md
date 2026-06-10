@@ -47,6 +47,28 @@ Pattern: **propose → get approval → generate → share result → get approv
 
 ## Full Pipeline
 
+### STEP 0: Pre-flight — verify the YouTube token EARLY
+
+If this video is likely headed to YouTube, verify the upload token at the start of the pipeline — never discover a dead token after a long render. A force-refresh is the only reliable test (`invalid_grant` does not show up by inspecting the file):
+
+```bash
+python3 - <<'EOF'
+import json
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+d = json.load(open('/workspace/secrets/mom_account_google_oauth_creds.json'))
+creds = Credentials(token=d.get('token'), refresh_token=d.get('refresh_token'),
+                    token_uri=d.get('token_uri'), client_id=d.get('client_id'),
+                    client_secret=d.get('client_secret'), scopes=d.get('scopes'))
+try:
+    creds.refresh(Request()); print('TOKEN OK')
+except Exception as e:
+    print('TOKEN BROKEN:', e)
+EOF
+```
+
+If TOKEN BROKEN, tell the user right away (re-auth needs a human step on the host — see the youtube-upload skill's OAuth Setup) and continue making the video meanwhile; just don't reach the upload step assuming credentials work.
+
 ### STEP 1: Concept — Ask Theme & Duration
 
 Ask what kind of video, currently we make two kinds: Instrumental and hindi devotional. (Present these choices in hindi/hinglish depending upon how user is talking)
