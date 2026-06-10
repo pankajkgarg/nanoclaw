@@ -264,7 +264,7 @@ The `-af afade` ensures a gentle audio fade-out in the last 5 seconds.
 
 
 
-### STEP 8: Post-Production (AUTOMATIC after video approval)
+### STEP 8: Post-Production (after video approval — prepare materials only, upload still needs its own approval)
 
 #### 8a. YouTube Title & Description
 
@@ -298,9 +298,16 @@ ffmpeg -i hero.jpg -vf "scale=1280:720,\
 
 Thumbnail must be: JPG/PNG, max 2MB, 1280x720.
 
-### STEP 9: YouTube Upload (optional)
+### STEP 9: YouTube Upload (only after explicit user approval)
 
-If user wants to upload, use the **youtube-upload** skill:
+**BLOCKING GATE — read carefully:**
+- Upload only when the user explicitly asks in their recent messages ("upload karo", "upload kar do", "yes upload").
+- A date by itself ("3 May", "29 ka") is NOT upload approval — it only sets the publish/schedule date. Ask first: "Upload kar doon? <date> ko publish schedule karunga."
+- "Ok" / "theek hai" on a preview is NOT upload approval — it only approves the preview. Ask: "YouTube pe upload kar doon?"
+- Always upload `--privacy private` (or private + scheduled publish). Never make a video public unless the user explicitly says so.
+- One approval covers one upload. A re-render, replacement, or next video needs fresh approval.
+
+Once the user has approved, use the **youtube-upload** skill:
 ```bash
 cp ~/.claude/skills/youtube-upload/scripts/youtube_upload.py /workspace/
 cp ~/.claude/skills/youtube-upload/scripts/set_thumbnail.py /workspace/

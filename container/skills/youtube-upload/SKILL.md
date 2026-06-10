@@ -14,6 +14,14 @@ tags:
 
 # YouTube Video Upload
 
+## Upload Gate (BLOCKING — check before anything else)
+
+1. Confirm the user explicitly asked to upload **this** video in their recent messages ("upload karo", "upload kar do"). These are NOT upload approval:
+   - a publish date by itself ("3 May", "29 ka") — that only sets the schedule; ask "Upload kar doon? <date> ko publish schedule karunga"
+   - "Ok" / "theek hai" / 👍 on a preview — that only approves the preview; ask "YouTube pe upload kar doon?"
+2. Privacy defaults to `private`. NEVER use `--privacy public`, and never flip an already-uploaded video to public, unless the user explicitly says to make it public. When the user gives a date, prefer private + scheduled publish.
+3. One approval covers one upload. Re-uploads, replacements, and new versions each need fresh approval.
+
 ## Bundled Scripts
 
 Two scripts live inside this skill under scripts/:
