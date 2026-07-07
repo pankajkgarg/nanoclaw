@@ -3,6 +3,8 @@ onlyBuiltDependencies:
   - esbuild
   - protobufjs
   - sharp
+patchedDependencies:
+  '@whiskeysockets/baileys@7.0.0-rc12': patches/@whiskeysockets__baileys@7.0.0-rc12.patch
 
 pnpm:
   minimumReleaseAge: 4320

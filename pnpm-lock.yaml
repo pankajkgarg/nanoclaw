@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@whiskeysockets/baileys@7.0.0-rc12':
+    hash: 5ed2b0f099c469c63e1079e5172730d4dea7aabdd37a0fe57ecb794773e8c8e0
+    path: patches/@whiskeysockets__baileys@7.0.0-rc12.patch
+
 importers:
 
   .:
@@ -28,7 +33,7 @@ importers:
         version: 1.5.6
       '@whiskeysockets/baileys':
         specifier: 7.0.0-rc12
-        version: 7.0.0-rc12(sharp@0.34.5)
+        version: 7.0.0-rc12(patch_hash=5ed2b0f099c469c63e1079e5172730d4dea7aabdd37a0fe57ecb794773e8c8e0)(sharp@0.34.5)
       better-sqlite3:
         specifier: 11.10.0
         version: 11.10.0
@@ -2576,7 +2581,7 @@ snapshots:
       convert-source-map: 2.0.0
       tinyrainbow: 3.1.0
 
-  '@whiskeysockets/baileys@7.0.0-rc12(sharp@0.34.5)':
+  '@whiskeysockets/baileys@7.0.0-rc12(patch_hash=5ed2b0f099c469c63e1079e5172730d4dea7aabdd37a0fe57ecb794773e8c8e0)(sharp@0.34.5)':
     dependencies:
       '@cacheable/node-cache': 1.7.6
       '@hapi/boom': 9.1.4

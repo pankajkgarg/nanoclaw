@@ -1,0 +1,19 @@
+diff --git a/lib/Utils/decode-wa-message.js b/lib/Utils/decode-wa-message.js
+index f2bc9228e941a0cb3c68560eb46d0081070fc024..909b264480d5911b65ef0c7963d629e156c3c280 100644
+--- a/lib/Utils/decode-wa-message.js
++++ b/lib/Utils/decode-wa-message.js
+@@ -127,6 +127,14 @@ export function decodeMessageNode(stanza, meId, meLid) {
+         }
+         else {
+             chatId = from;
++            // Self-originated 1:1 stanzas without a recipient attr (self-chat
++            // messages and peer-data-operation responses from the primary
++            // phone) must still be marked fromMe — otherwise the anti-spoof
++            // guard in process-message drops legitimate placeholder-resend
++            // responses and undecryptable messages can never be recovered.
++            if (isMe(from) || isMeLid(from)) {
++                fromMe = true;
++            }
+         }
+         msgType = 'chat';
+         author = from;

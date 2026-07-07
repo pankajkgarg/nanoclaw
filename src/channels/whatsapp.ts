@@ -40,13 +40,18 @@ import { registerChannelAdapter } from './channel-registry.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundMessage, OutboundMessage } from './adapter.js';
 
-const baileysLogger = pino({ level: 'silent' });
+// 'error' surfaces decryption failures (the cause of silently lost inbound
+// messages); raise to 'silent' only if it gets too noisy.
+const baileysLogger = pino({ level: 'error' });
 
 const AUTH_DIR = path.join(process.cwd(), 'store', 'auth');
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
-const SENT_MESSAGE_CACHE_MAX = 256;
+const SENT_MESSAGE_CACHE_MAX = 512;
+const SENT_MESSAGE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const SENT_MESSAGE_CACHE_FILE = path.join(process.cwd(), 'store', 'whatsapp-sent-cache.json');
 const RECONNECT_DELAY_MS = 5000;
+const RECONNECT_MAX_DELAY_MS = 5 * 60 * 1000;
 const PENDING_QUESTIONS_MAX = 64;
 const WA_VERSION_FETCH_TIMEOUT_MS = 5000;
 const FIRST_OPEN_TIMEOUT_MS = 30_000;
@@ -169,8 +174,53 @@ registerChannelAdapter('whatsapp', {
     const outgoingQueue: Array<{ jid: string; text: string }> = [];
     let flushing = false;
 
-    // Sent message cache for retry/re-encrypt requests
-    const sentMessageCache = new Map<string, any>();
+    // Sent message cache for retry/re-encrypt requests. Disk-backed: retry
+    // receipts can arrive hours after the send (or after a service restart),
+    // and a retry we cannot serve leaves that recipient permanently on
+    // "Waiting for this message".
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sentMessageCache = new Map<string, { message: any; ts: number }>();
+    let persistSentCacheTimer: NodeJS.Timeout | undefined;
+
+    try {
+      const raw = JSON.parse(fs.readFileSync(SENT_MESSAGE_CACHE_FILE, 'utf-8')) as {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        entries?: Record<string, { message: any; ts: number }>;
+      };
+      const loaded = Object.entries(raw.entries ?? {})
+        .filter(([, v]) => v && typeof v.ts === 'number' && Date.now() - v.ts < SENT_MESSAGE_CACHE_TTL_MS)
+        .sort(([, a], [, b]) => a.ts - b.ts);
+      for (const [id, v] of loaded) sentMessageCache.set(id, v);
+      if (sentMessageCache.size > 0) {
+        log.info('Loaded WhatsApp sent-message cache', { size: sentMessageCache.size });
+      }
+    } catch {
+      // Missing or unreadable cache file — start empty.
+    }
+
+    function persistSentCacheSoon(): void {
+      if (persistSentCacheTimer) return;
+      persistSentCacheTimer = setTimeout(() => {
+        persistSentCacheTimer = undefined;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const entries: Record<string, { message: any; ts: number }> = {};
+        for (const [id, v] of sentMessageCache) entries[id] = v;
+        fs.promises
+          .writeFile(SENT_MESSAGE_CACHE_FILE, JSON.stringify({ entries }), 'utf-8')
+          .catch((err) => log.debug('Failed to persist WhatsApp sent-message cache', { err }));
+      }, 1000);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function cacheSentMessage(sent: { key?: { id?: string | null } | null; message?: any } | undefined): void {
+      if (!sent?.key?.id || !sent.message) return;
+      sentMessageCache.set(sent.key.id, { message: sent.message, ts: Date.now() });
+      while (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
+        const oldest = sentMessageCache.keys().next().value!;
+        sentMessageCache.delete(oldest);
+      }
+      persistSentCacheSoon();
+    }
 
     // Group metadata cache with TTL
     const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
@@ -329,9 +379,7 @@ registerChannelAdapter('whatsapp', {
         while (outgoingQueue.length > 0) {
           const item = outgoingQueue.shift()!;
           const sent = await sock.sendMessage(item.jid, { text: item.text }, { useCachedGroupMetadata: false });
-          if (sent?.key?.id && sent.message) {
-            sentMessageCache.set(sent.key.id, sent.message);
-          }
+          cacheSentMessage(sent);
         }
       } finally {
         flushing = false;
@@ -378,13 +426,7 @@ registerChannelAdapter('whatsapp', {
       }
       try {
         const sent = await sock.sendMessage(jid, { text }, { useCachedGroupMetadata: false });
-        if (sent?.key?.id && sent.message) {
-          sentMessageCache.set(sent.key.id, sent.message);
-          if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
-            const oldest = sentMessageCache.keys().next().value!;
-            sentMessageCache.delete(oldest);
-          }
-        }
+        cacheSentMessage(sent);
         return sent?.key?.id ?? undefined;
       } catch (err) {
         outgoingQueue.push({ jid, text });
@@ -395,8 +437,42 @@ registerChannelAdapter('whatsapp', {
 
     // --- Socket creation ---
 
+    // Single auth state + signal key cache shared across reconnects.
+    // Re-creating these per reconnect leaves the old socket's cache still
+    // flushing writes while the new one reads a stale snapshot of the same
+    // files — lost ratchet updates that surface days later as Bad MAC
+    // decrypt failures and "Waiting for this message" on peers.
+    let authState: Awaited<ReturnType<typeof useMultiFileAuthState>> | undefined;
+    let sharedKeyStore: ReturnType<typeof makeCacheableSignalKeyStore> | undefined;
+
+    // Reconnect must be single-flight with backoff. Reconnecting directly
+    // from every close event multiplies sockets: N parallel sockets each
+    // emit close and each spawns a replacement, so one bad night of 408
+    // timeouts compounds into a hot loop (observed: 50k+ reconnect attempts
+    // overnight) with dozens of sockets sharing one Signal key store.
+    let reconnectTimer: NodeJS.Timeout | undefined;
+    let reconnectDelayMs = 0;
+
+    function scheduleReconnect(): void {
+      if (reconnectTimer) return;
+      const delay = reconnectDelayMs;
+      reconnectDelayMs = Math.min(Math.max(reconnectDelayMs * 2, RECONNECT_DELAY_MS), RECONNECT_MAX_DELAY_MS);
+      log.info('Scheduling WhatsApp reconnect', { delayMs: delay });
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = undefined;
+        connectSocket().catch((err) => {
+          log.error('WhatsApp reconnect failed', { err });
+          scheduleReconnect();
+        });
+      }, delay);
+    }
+
     async function connectSocket(): Promise<void> {
-      const { state, saveCreds } = await useMultiFileAuthState(authDir);
+      if (!authState) {
+        authState = await useMultiFileAuthState(authDir);
+        sharedKeyStore = makeCacheableSignalKeyStore(authState.state.keys, baileysLogger);
+      }
+      const { state, saveCreds } = authState;
 
       const { version } = await Promise.race([
         fetchLatestWaWebVersion({}),
@@ -410,18 +486,35 @@ registerChannelAdapter('whatsapp', {
         version,
         auth: {
           creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+          keys: sharedKeyStore!,
         },
         printQRInTerminal: false,
         logger: baileysLogger,
         browser: Browsers.macOS('Chrome'),
         cachedGroupMetadata: async (jid: string) => getNormalizedGroupMetadata(jid),
         getMessage: async (key: WAMessageKey) => {
-          // Check in-memory cache first (recently sent messages)
           const cached = sentMessageCache.get(key.id || '');
-          if (cached) return cached;
-          // Return empty message to prevent indefinite "waiting for this message"
-          return proto.Message.fromObject({});
+          if (cached) {
+            log.info('WhatsApp retry: serving cached sent message', {
+              messageId: key.id,
+              remoteJid: key.remoteJid,
+              ageMs: Date.now() - cached.ts,
+            });
+            // fromObject passes proto instances through and revives plain
+            // objects loaded from the disk cache.
+            return proto.Message.fromObject(cached.message);
+          }
+          // Never return an empty message here: Baileys would mark the retry
+          // successful and resend a BLANK with the same id, leaving the
+          // recipient permanently on "Waiting for this message". Returning
+          // undefined skips the resend but keeps the session-heal side
+          // effects of the retry receipt.
+          log.warn('WhatsApp retry: sent message not in cache, skipping resend', {
+            messageId: key.id,
+            remoteJid: key.remoteJid,
+            cacheSize: sentMessageCache.size,
+          });
+          return undefined;
         },
       });
 
@@ -439,8 +532,16 @@ registerChannelAdapter('whatsapp', {
         }, 3000);
       }
 
+      const thisSock = sock;
       sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
+
+        // A newer socket has replaced this one — its lifecycle events must
+        // not flip adapter state or trigger another reconnect.
+        if (sock !== thisSock) {
+          if (connection) log.debug('Ignoring stale WhatsApp socket event', { connection });
+          return;
+        }
 
         if (qr && !phoneNumber) {
           // QR code auth — print to terminal
@@ -463,15 +564,7 @@ registerChannelAdapter('whatsapp', {
           log.info('WhatsApp connection closed', { reason, shouldReconnect });
 
           if (shouldReconnect) {
-            log.info('Reconnecting...');
-            connectSocket().catch((err) => {
-              log.error('Failed to reconnect, retrying in 5s', { err });
-              setTimeout(() => {
-                connectSocket().catch((err2) => {
-                  log.error('Reconnection retry failed', { err: err2 });
-                });
-              }, RECONNECT_DELAY_MS);
-            });
+            scheduleReconnect();
           } else {
             log.info('WhatsApp logged out');
             if (rejectFirstOpen) {
@@ -482,6 +575,7 @@ registerChannelAdapter('whatsapp', {
           }
         } else if (connection === 'open') {
           connected = true;
+          reconnectDelayMs = 0;
           log.info('Connected to WhatsApp');
 
           // Clean up pairing code file after successful connection
@@ -500,10 +594,12 @@ registerChannelAdapter('whatsapp', {
           if (sock.user) {
             const phoneUser = sock.user.id.split(':')[0];
             const lidUser = sock.user.lid?.split(':')[0];
+            if (phoneUser) {
+              botPhoneUser = phoneUser;
+            }
             if (lidUser && phoneUser) {
               setLidPhoneMapping(lidUser, `${phoneUser}@s.whatsapp.net`);
               botLidUser = lidUser;
-              botPhoneUser = phoneUser;
             }
           }
           persistKnownLidMappings().catch((err) => log.debug('Failed to store known LID mappings', { err }));
@@ -542,9 +638,25 @@ registerChannelAdapter('whatsapp', {
       sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {
           try {
-            if (!msg.message) continue;
+            if (!msg.message) {
+              log.info('WhatsApp inbound skipped: no payload (undecryptable or stub)', {
+                remoteJid: msg.key.remoteJid,
+                messageId: msg.key.id,
+                fromMe: msg.key.fromMe || false,
+                stubType: msg.messageStubType,
+                stubParams: msg.messageStubParameters,
+              });
+              continue;
+            }
             const normalized = normalizeMessageContent(msg.message);
-            if (!normalized) continue;
+            if (!normalized) {
+              log.info('WhatsApp inbound skipped: unnormalizable payload', {
+                remoteJid: msg.key.remoteJid,
+                messageId: msg.key.id,
+                messageTypes: Object.keys(msg.message),
+              });
+              continue;
+            }
             const rawJid = msg.key.remoteJid;
             if (!rawJid || rawJid === 'status@broadcast') continue;
             if (msg.key.participantAlt && msg.key.participant?.endsWith('@lid')) {
@@ -591,16 +703,48 @@ registerChannelAdapter('whatsapp', {
             const attachments = await downloadInboundMedia(msg, normalized);
 
             // Skip empty protocol messages (no text and no attachments)
-            if (!content && attachments.length === 0) continue;
+            if (!content && attachments.length === 0) {
+              log.info('WhatsApp inbound skipped: no text or attachments', {
+                chatJid,
+                messageId: msg.key.id,
+                fromMe: msg.key.fromMe || false,
+                messageTypes: Object.keys(normalized),
+                protocolType: normalized.protocolMessage?.type,
+                peerOpType: normalized.protocolMessage?.peerDataOperationRequestMessage?.peerDataOperationRequestType,
+              });
+              continue;
+            }
 
             const sender = msg.key.participant || msg.key.remoteJid || '';
             const senderName = msg.pushName || sender.split('@')[0];
             const isBotMessage = ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`);
             const fromMe = msg.key.fromMe || false;
-            // Dedicated number: every fromMe event is the assistant.
-            // Shared personal number: the user's own phone messages also
-            // arrive as fromMe, so only suppress assistant-prefixed echoes.
-            if (fromMe && (ASSISTANT_HAS_OWN_NUMBER || isBotMessage)) continue;
+            // Dedicated number: fromMe events are normally the bot's own echoes.
+            // Exception: the assistant's own-number self-chat — user-typed
+            // linked-device messages and bot replies both arrive as fromMe, so
+            // use the sent-message cache to suppress only the bot's echoes.
+            if (fromMe) {
+              const isSelfChat = botPhoneUser ? chatJid === normalizePhoneJid(botPhoneUser) : false;
+              if (ASSISTANT_HAS_OWN_NUMBER) {
+                const cachedBotEcho = sentMessageCache.has(msg.key.id || '');
+                if (!isSelfChat || cachedBotEcho) {
+                  log.info('WhatsApp inbound skipped: fromMe gate', {
+                    chatJid,
+                    messageId: msg.key.id,
+                    isSelfChat,
+                    cachedBotEcho,
+                    botPhoneUser,
+                  });
+                  continue;
+                }
+              } else if (isBotMessage) {
+                log.info('WhatsApp inbound skipped: assistant-prefixed echo', {
+                  chatJid,
+                  messageId: msg.key.id,
+                });
+                continue;
+              }
+            }
 
             // Check if this reply answers a pending question via slash command
             const pending = pendingQuestions.get(chatJid);
@@ -742,9 +886,7 @@ registerChannelAdapter('whatsapp', {
               const caption = !captionUsed ? text : undefined;
               const mediaMsg = buildMediaMessage(file.data, file.filename, ext, caption);
               const sent = await sock.sendMessage(platformId, mediaMsg, { useCachedGroupMetadata: false });
-              if (sent?.key?.id && sent.message) {
-                sentMessageCache.set(sent.key.id, sent.message);
-              }
+              cacheSentMessage(sent);
               if (caption) captionUsed = true;
             } catch (err) {
               log.error('Failed to send file', { platformId, filename: file.filename, err });
